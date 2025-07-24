@@ -1141,6 +1141,7 @@ class AscendFusedMoE(FusedMoE):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
+        enable_sp: bool = False,
     ):
         # TODO: This could not initialize FusedMoE baseclass,
         # fixme and make __init__() of AscendFusedMoE more clear
@@ -1182,6 +1183,7 @@ class AscendFusedMoE(FusedMoE):
         self.activation = activation
         self.log2phy = None
         self.global_redundant_expert_num = 0
+        self.enable_sp = enable_sp
 
         ascend_config = get_ascend_config()
         expert_map_path = ascend_config.expert_map_path
@@ -1331,7 +1333,7 @@ class AscendFusedMoE(FusedMoE):
 
         mc2_mask = forward_context.mc2_mask
         tp_size = get_tensor_model_parallel_world_size()
-        if fused_moe_state != FusedMoEState.AllGather:
+        if fused_moe_state != FusedMoEState.AllGather and not self.enable_sp:
             if fused_moe_state in {
                     FusedMoEState.MC2, FusedMoEState.MC2_PREFILL
             }:
@@ -1414,7 +1416,7 @@ class AscendFusedMoE(FusedMoE):
             self.moe_load += expert_token_num if group_list_type else \
                 torch.cat([expert_token_num[:1], expert_token_num[1:] - expert_token_num[:-1]])
 
-        if fused_moe_state != FusedMoEState.AllGather:
+        if fused_moe_state != FusedMoEState.AllGather and not self.enable_sp:
             if tp_size > 1:
                 dist.all_gather(list(chunk_hidden_states), e_hidden_states,
                                 self.tp_group)
