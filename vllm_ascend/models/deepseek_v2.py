@@ -210,7 +210,7 @@ class CustomDeepseekV2RowParallelLinear(RowParallelLinear):
                                                   bias=bias_)
         is_prefill = 0
         attn_metadata = get_forward_context().attn_metadata
-        if attn_metadata:
+        if attn_metadata and hasattr(attn_metadata, "num_prefills"):
             is_prefill = attn_metadata.num_prefills > 0
                
         if self.reduce_results and self.enable_sp and is_prefill:
@@ -603,7 +603,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
                                   and attn_metadata.num_decodes > 0)
         forward_kwargs = {"enable_multistream_mla": enable_multistream_mla}
         is_prefill = 0
-        if forward_context.attn_metadata:
+        if forward_context.attn_metadata and hasattr(forward_context.attn_metadata, "num_prefills"):
             is_prefill = forward_context.attn_metadata.num_prefills
         if self.q_lora_rank is not None:
             npu_prefetch(self.q_a_proj.weight,
@@ -672,29 +672,46 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         layer_idx = int(prefix.split(sep='.')[-1])
         self.layer_idx = layer_idx
         # TODO: enable mla in vllm-ascend
+        self.enable_sp = enable_sp
         if model_config.use_mla:
             attn_cls = CustomDeepseekV2MLAAttention
+            self.self_attn = attn_cls(
+                config=config,
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                q_lora_rank=config.q_lora_rank
+                if hasattr(config, "q_lora_rank") else None,
+                kv_lora_rank=config.kv_lora_rank,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.self_attn",
+                enable_sp = self.enable_sp,
+            )
         else:
             attn_cls = DeepseekV2Attention
-        self.enable_sp = enable_sp
-        self.self_attn = attn_cls(
-            config=config,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            q_lora_rank=config.q_lora_rank
-            if hasattr(config, "q_lora_rank") else None,
-            kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
-            enable_sp = self.enable_sp,
-        )
+            self.self_attn = attn_cls(
+                config=config,
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                q_lora_rank=config.q_lora_rank
+                if hasattr(config, "q_lora_rank") else None,
+                kv_lora_rank=config.kv_lora_rank,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.self_attn",
+            )
 
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
@@ -743,13 +760,19 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             dispose_tensor(previous_hidden_states)
             dispose_tensor(previous_residual)
 
-        hidden_states = self.self_attn(
-            original_len=original_len,
-            positions=positions,
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-        )
+        if isinstance(self.self_attn, CustomDeepseekV2MLAAttention):
+            hidden_states = self.self_attn(
+                original_len=original_len,
+                positions=positions,
+                hidden_states=hidden_states,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+            )
+        else:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
 
         if hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
@@ -798,7 +821,7 @@ class CustomDeepseekV2Model(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         
-        self.enable_sp = True
+        self.enable_sp = False
         self.sp_size = get_tensor_model_parallel_world_size()
         self.sp_group = get_tp_group().device_group
 
@@ -849,7 +872,7 @@ class CustomDeepseekV2Model(nn.Module):
         original_len = 1
         is_prefill = 0
         attn_metadata = get_forward_context().attn_metadata
-        if attn_metadata:
+        if attn_metadata and hasattr(attn_metadata, "num_prefills"):
             is_prefill = attn_metadata.num_prefills
         
         if get_pp_group().is_first_rank:
