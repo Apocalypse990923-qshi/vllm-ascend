@@ -21,9 +21,22 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+import torch.nn.functional as F
 from transformers import PretrainedConfig
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              get_tp_group, split_tensor_along_last_dim,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_all_reduce,
+                              tensor_model_parallel_reduce_scatter,
+                              get_context_model_parallel_world_size,
+                              get_cp_group,
+                              get_cp_group,
+                              divide)
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -37,7 +50,35 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
-from .deepseek_v2 import CustomDeepseekV2DecoderLayer
+from .deepseek_v2 import CustomDeepseekV2DecoderLayer, VocabParallelEmbeddingwithSP
+from collections.abc import Sequence
+
+def split_tensor_along_first_dim(
+    tensor: torch.Tensor,
+    num_partitions: int,
+    contiguous_split_chunks: bool = False,
+) -> Sequence[torch.Tensor]:
+    """ Split a tensor along its first dimension.
+
+        Arguments:
+            tensor: input tensor.
+            num_partitions: number of partitions to split the tensor
+            contiguous_split_chunks: If True, make each chunk contiguous
+                                     in memory.
+
+        Returns:
+            A list of Tensors
+    """
+    # Get the size and dimension.
+    first_dim = 0
+    first_dim_size = divide(tensor.size()[first_dim], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, first_dim_size, dim=first_dim)
+    # NOTE: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
 
 
 class CustomDeepSeekShareHead(SharedHead):
@@ -63,6 +104,7 @@ class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
         model_config: ModelConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        enable_sp: bool = False,
     ) -> None:
         nn.Module.__init__(self)
 
@@ -75,13 +117,16 @@ class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
                                                    quant_config=quant_config,
                                                    prefix=maybe_prefix(
                                                        prefix, "shared_head"))
+        self.enable_sp = enable_sp
         self.mtp_block = CustomDeepseekV2DecoderLayer(config, prefix,
                                                       model_config,
                                                       cache_config,
-                                                      quant_config)
+                                                      quant_config,
+                                                      enable_sp = self.enable_sp)
 
     def forward(
         self,
+        original_len: int,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_cache: torch.Tensor,
@@ -89,6 +134,7 @@ class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: Optional[torch.Tensor] = None,
         spec_step_index: int = 0,
+        mtp_is_prefill: bool = False,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
         # masking inputs at position 0, as not needed by MTP
@@ -101,11 +147,13 @@ class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
         hidden_states = self.eh_proj(
             torch.cat([inputs_embeds, previous_hidden_states], dim=-1))
 
-        hidden_states, residual = self.mtp_block(positions=positions,
+        hidden_states, residual = self.mtp_block(original_len=original_len,
+                                                 positions=positions,
                                                  hidden_states=hidden_states,
                                                  kv_cache=kv_cache,
                                                  attn_metadata=attn_metadata,
-                                                 residual=None)
+                                                 residual=None,
+                                                 mtp_is_prefill = mtp_is_prefill)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -117,6 +165,9 @@ class CustomDeepSeekMultiTokenPredictor(DeepSeekMultiTokenPredictor):
         config = vllm_config.model_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
+        self.enable_sp = vllm_config.parallel_config.enable_sequence_parallel
+        self.sp_size = get_tensor_model_parallel_world_size()
+        self.sp_group = get_tp_group().device_group
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict({
             str(idx):
@@ -126,14 +177,16 @@ class CustomDeepSeekMultiTokenPredictor(DeepSeekMultiTokenPredictor):
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,
                 quant_config=vllm_config.quant_config,
+                enable_sp=self.enable_sp,
             )
             for idx in range(self.mtp_start_layer_idx,
                              self.mtp_start_layer_idx + self.num_mtp_layers)
         })
-        self.embed_tokens = VocabParallelEmbedding(
+        self.embed_tokens = VocabParallelEmbeddingwithSP(
             config.vocab_size,
             config.hidden_size,
-        )
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.embed_tokens")
 
         # Note: torch._dynamo.exc.Unsupported: builtin: str
         self.layers_list = [
@@ -142,6 +195,11 @@ class CustomDeepSeekMultiTokenPredictor(DeepSeekMultiTokenPredictor):
                              self.mtp_start_layer_idx + self.num_mtp_layers)
         ]
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def get_input_embeddings(self, mtp_is_prefill: bool, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.enable_sp and mtp_is_prefill:
+            return self.embed_tokens(input_=input_ids, enable_sp=self.enable_sp)
+        return self.embed_tokens(input_ids)
 
     def forward(
         self,
@@ -153,12 +211,28 @@ class CustomDeepSeekMultiTokenPredictor(DeepSeekMultiTokenPredictor):
         inputs_embeds: Optional[torch.Tensor] = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        original_len = 1
+        mtp_is_prefill = 0
+        attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata and hasattr(attn_metadata, "num_prefills"):
+            mtp_is_prefill = attn_metadata.num_prefills
+
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            original_len = input_ids.shape[0]
+            inputs_embeds = self.get_input_embeddings(mtp_is_prefill, input_ids)
         current_step_idx = (spec_step_idx % self.num_mtp_layers)
         step_kv_cache = kv_caches[
             current_step_idx] if kv_caches is not None else None
-        return self.layers_list[current_step_idx](
+        if self.enable_sp and mtp_is_prefill:  # previous_hidden_states should be splited as well
+            reminder = original_len % self.sp_size
+            if reminder > 0:
+                padding_len = self.sp_size - reminder
+                previous_hidden_states = F.pad(previous_hidden_states, (0, 0, 0, padding_len), mode='constant', value=0)
+            sp_rank = get_tensor_model_parallel_rank()
+            previous_hidden_states = split_tensor_along_first_dim(
+                previous_hidden_states, num_partitions=self.sp_size)[sp_rank].contiguous()
+        hidden_states = self.layers_list[current_step_idx](
+            original_len,
             input_ids,
             positions,
             step_kv_cache,
@@ -166,7 +240,15 @@ class CustomDeepSeekMultiTokenPredictor(DeepSeekMultiTokenPredictor):
             previous_hidden_states,
             inputs_embeds,
             current_step_idx,
+            mtp_is_prefill,
         )
+        if self.enable_sp and mtp_is_prefill:
+            print(f"[Rank {get_tensor_model_parallel_rank()}] before all_gather: {hidden_states.shape}")
+            chunk_hidden_states = [torch.empty_like(hidden_states) for _ in range(self.sp_size)]
+            dist.all_gather(list(chunk_hidden_states), hidden_states, self.sp_group)
+            hidden_states = torch.cat(chunk_hidden_states, dim=0)
+            hidden_states = hidden_states[:original_len]
+        return hidden_states
 
     def compute_logits(
         self,
