@@ -13,7 +13,7 @@
 # This file is a part of the vllm-ascend project.
 #
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, MagicMock
 
 import pytest
 import torch
@@ -213,9 +213,14 @@ def test_custom_deepseek_v2_mlp(mock_distributed, base_config):
                             hidden_act="relu",
                             quant_config=None)
 
-
-def test_custom_deepseek_v2_moe(mock_distributed, base_config,
+@patch('vllm.distributed.parallel_state._CP',
+           new_callable=lambda: MagicMock(spec=GroupCoordinator))
+@patch("vllm.distributed.get_context_model_parallel_world_size",
+           return_value=1)
+def test_custom_deepseek_v2_moe(mock_get_context_world_size, mock_cp,
+                                mock_distributed, base_config,
                                 mock_forward_context):
+    mock_cp.world_size = 1
     base_config.n_shared_experts = 1
     moe = CustomDeepseekV2MoE(config=base_config,
                               quant_config=None,
@@ -230,9 +235,15 @@ def test_custom_deepseek_v2_moe(mock_distributed, base_config,
         assert output.shape == (2, 4, 128)
 
 
+@patch('vllm.distributed.parallel_state._CP',
+           new_callable=lambda: MagicMock(spec=GroupCoordinator))
+@patch("vllm.distributed.get_context_model_parallel_world_size",
+           return_value=1)
 @patch("torch_npu.npu_rms_norm")
-def test_custom_deepseek_v2_mla_attention(mock_rms_norm, mock_distributed,
-                                          base_config):
+def test_custom_deepseek_v2_mla_attention(mock_rms_norm, 
+                                          mock_get_context_world_size, mock_cp,
+                                          mock_distributed, base_config):
+    mock_cp.world_size = 1
     mock_rms_norm.return_value = (torch.randn(2, 128), torch.randn(2, 128))
 
     attn = CustomDeepseekV2MLAAttention(config=base_config,

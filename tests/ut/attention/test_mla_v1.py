@@ -234,17 +234,23 @@ class TestAscendMLAMetadataBuilder(TestBase):
 
 class TestAscendMLAImpl(TestBase):
 
+    @patch('vllm.distributed.parallel_state._CP',
+           new_callable=lambda: MagicMock(spec=GroupCoordinator))
+    @patch("vllm.distributed.get_context_model_parallel_world_size",
+           return_value=1)
     @patch('vllm.distributed.parallel_state._TP',
            new_callable=lambda: MagicMock(spec=GroupCoordinator))
     @patch("vllm.distributed.get_tensor_model_parallel_world_size",
            return_value=2)
     @patch("vllm.config.get_current_vllm_config")
     @patch("vllm_ascend.attention.mla_v1.get_ascend_config")
-    def setUp(self, ascend_config, vllm_config, mock_get_tp_size, mock_tp):
+    def setUp(self, ascend_config, vllm_config, mock_get_tp_size, mock_tp, mock_get_cp_size, mock_cp):
         mock_tp.world_size = 2
+        mock_cp.world_size = 1
         speculative_config = MagicMock()
         speculative_config.num_speculative_tokens = 4
         vllm_config.speculative_config = speculative_config
+        vllm_config.parallel_config.enable_sequence_parallel = False
 
         num_heads = 256
         head_size = 1024
