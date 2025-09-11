@@ -17,7 +17,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
-
+from vllm_ascend.ascend_config import AscendConfig
+from vllm.forward_context import ForwardContext
 from vllm_ascend.ops.vocab_parallel_embedding import (
     AscendLogitsProcessor, AscendParallelLMHead, AscendVocabParallelEmbedding)
 
@@ -65,8 +66,16 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
                                                      embedding_dim))
             return layer
 
-    def test_get_masked_input_and_mask(self):
+    @patch('vllm.forward_context._forward_context',
+           new_callable=lambda: MagicMock(spec=ForwardContext))
+    @patch("vllm.config.get_current_vllm_config")
+    @patch('vllm_ascend.ascend_config._ASCEND_CONFIG',
+           new_callable=lambda: MagicMock(spec=AscendConfig))
+    def test_get_masked_input_and_mask(self, mock_ascend_config, vllm_config, mock_forward_context):
         """Test the mask and offset calculation helper function."""
+        mock_ascend_config.lmhead_tensor_parallel_size = None
+        vllm_config.parallel_config.enable_sequence_parallel = False
+        mock_forward_context.attn_metadata = None
         layer = self._create_layer()
 
         input_ = torch.tensor([5, 15, 25, 35, 45])
@@ -90,8 +99,16 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
             f"Masked input mismatch. Expected {expected_masked}, got {masked_input}"
         )
 
-    def test_forward_with_tp_size_1(self):
+    @patch('vllm.forward_context._forward_context',
+           new_callable=lambda: MagicMock(spec=ForwardContext))
+    @patch("vllm.config.get_current_vllm_config")
+    @patch('vllm_ascend.ascend_config._ASCEND_CONFIG',
+           new_callable=lambda: MagicMock(spec=AscendConfig))
+    def test_forward_with_tp_size_1(self, mock_ascend_config, vllm_config, mock_forward_context):
         """Test forward pass without tensor parallelism."""
+        mock_ascend_config.lmhead_tensor_parallel_size = None
+        vllm_config.parallel_config.enable_sequence_parallel = False
+        mock_forward_context.attn_metadata = None
         # Create a fresh mock embedding with tp_size=1
         layer = self._create_layer()
         layer.tp_size = 1
@@ -113,7 +130,15 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
         # Verify all_reduce was called once
         mock_reduce_tp1.assert_called_once()
 
-    def test_forward_with_tp(self):
+    @patch('vllm.forward_context._forward_context',
+           new_callable=lambda: MagicMock(spec=ForwardContext))
+    @patch("vllm.config.get_current_vllm_config")
+    @patch('vllm_ascend.ascend_config._ASCEND_CONFIG',
+           new_callable=lambda: MagicMock(spec=AscendConfig))
+    def test_forward_with_tp(self, mock_ascend_config, vllm_config, mock_forward_context):
+        mock_ascend_config.lmhead_tensor_parallel_size = None
+        vllm_config.parallel_config.enable_sequence_parallel = False
+        mock_forward_context.attn_metadata = None
         layer = self._create_layer()
         layer.tp_size = 2
 
@@ -135,8 +160,16 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
         mock_reduce_tp.assert_called_once()
         self.assertEqual(output.shape, (2, self.embedding_dim))
 
-    def test_forward_with_invalid_vocab(self):
+    @patch('vllm.forward_context._forward_context',
+           new_callable=lambda: MagicMock(spec=ForwardContext))
+    @patch("vllm.config.get_current_vllm_config")
+    @patch('vllm_ascend.ascend_config._ASCEND_CONFIG',
+           new_callable=lambda: MagicMock(spec=AscendConfig))
+    def test_forward_with_invalid_vocab(self, mock_ascend_config, vllm_config, mock_forward_context):
         """Test that invalid vocab indices are properly masked out."""
+        mock_ascend_config.lmhead_tensor_parallel_size = None
+        vllm_config.parallel_config.enable_sequence_parallel = False
+        mock_forward_context.attn_metadata = None
         # Create a fresh embedding layer
         layer = self._create_layer()
         input_ = torch.tensor([5, 15, 25, 35, 45])  # includes invalid cases
@@ -159,8 +192,16 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
         self.assertTrue(torch.all(output[3] == mock_output[3]))
         self.assertEqual(output.shape, (5, self.embedding_dim))
 
-    def test_output_shape(self):
+    @patch('vllm.forward_context._forward_context',
+           new_callable=lambda: MagicMock(spec=ForwardContext))
+    @patch("vllm.config.get_current_vllm_config")
+    @patch('vllm_ascend.ascend_config._ASCEND_CONFIG',
+           new_callable=lambda: MagicMock(spec=AscendConfig))
+    def test_output_shape(self, mock_ascend_config, vllm_config, mock_forward_context):
         """Test that output shape is correct."""
+        mock_ascend_config.lmhead_tensor_parallel_size = None
+        vllm_config.parallel_config.enable_sequence_parallel = False
+        mock_forward_context.attn_metadata = None
         # Create a fresh embedding layer
         layer = self._create_layer()
 

@@ -202,7 +202,7 @@ class AscendMlpRowParallelLinear(RowParallelLinear):
         input_,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         forward_context = get_forward_context()
-        self.enable_sp = forward_context.enable_sp
+        self.enable_sp = is_sp_enabled()
         attn_metadata = forward_context.attn_metadata
         is_prefill = attn_metadata.num_prefills if attn_metadata else False
         if self.enable_mlp_optimze and not self.enable_sp:

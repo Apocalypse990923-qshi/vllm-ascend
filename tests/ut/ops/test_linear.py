@@ -1,9 +1,10 @@
 import os
 import unittest
 from unittest import mock
+from unittest.mock import MagicMock, patch
 
 import torch
-
+from vllm.forward_context import ForwardContext
 from vllm_ascend.ops.linear import (AscendMlpColumnParallelLinear,
                                     AscendMlpMergedColumnParallelLinear,
                                     AscendMlpRowParallelLinear, LinearBase,
@@ -75,7 +76,12 @@ class TestAscendMlpRowParallelLinear(unittest.TestCase):
         self.assertEqual(layer.tp_rank, self.mlp_tensor_parallel_rank)
         self.assertTrue(layer.enable_mlp_optimze)
 
-    def test_forward_with_mlp_optimize(self):
+    @patch('vllm.forward_context._forward_context',
+           new_callable=lambda: MagicMock(spec=ForwardContext))
+    @patch("vllm.config.get_current_vllm_config")
+    def test_forward_with_mlp_optimize(self, vllm_config, mock_forward_context):
+        vllm_config.parallel_config.enable_sequence_parallel = False
+        mock_forward_context.attn_metadata = None
         layer = AscendMlpRowParallelLinear(
             input_size=16,
             output_size=8,
@@ -88,7 +94,12 @@ class TestAscendMlpRowParallelLinear(unittest.TestCase):
         self.split_tensor_along_last_dim_mock.assert_called_once_with(
             input_tensor, num_partitions=layer.tp_size)
 
-    def test_forward_without_mlp_optimize(self):
+    @patch('vllm.forward_context._forward_context',
+           new_callable=lambda: MagicMock(spec=ForwardContext))
+    @patch("vllm.config.get_current_vllm_config")
+    def test_forward_without_mlp_optimize(self, vllm_config, mock_forward_context):
+        vllm_config.parallel_config.enable_sequence_parallel = False
+        mock_forward_context.attn_metadata = None
         layer = AscendMlpRowParallelLinear(
             input_size=16,
             output_size=8,
@@ -102,7 +113,12 @@ class TestAscendMlpRowParallelLinear(unittest.TestCase):
             input_tensor, num_partitions=layer.tp_size)
         self.tensor_model_parallel_all_reduce_mock.assert_called_once()
 
-    def test_skip_bias_add(self):
+    @patch('vllm.forward_context._forward_context',
+           new_callable=lambda: MagicMock(spec=ForwardContext))
+    @patch("vllm.config.get_current_vllm_config")
+    def test_skip_bias_add(self, vllm_config, mock_forward_context):
+        vllm_config.parallel_config.enable_sequence_parallel = False
+        mock_forward_context.attn_metadata = None
         layer = AscendMlpRowParallelLinear(
             input_size=16,
             output_size=8,
@@ -113,7 +129,12 @@ class TestAscendMlpRowParallelLinear(unittest.TestCase):
 
         self.assertIsNotNone(bias)
 
-    def test_no_reduce_results(self):
+    @patch('vllm.forward_context._forward_context',
+           new_callable=lambda: MagicMock(spec=ForwardContext))
+    @patch("vllm.config.get_current_vllm_config")
+    def test_no_reduce_results(self, vllm_config, mock_forward_context):
+        vllm_config.parallel_config.enable_sequence_parallel = False
+        mock_forward_context.attn_metadata = None
         layer = AscendMlpRowParallelLinear(input_size=16,
                                            output_size=8,
                                            reduce_results=False,
@@ -123,7 +144,12 @@ class TestAscendMlpRowParallelLinear(unittest.TestCase):
 
         self.tensor_model_parallel_all_reduce_mock.assert_not_called()
 
-    def test_input_not_parallel(self):
+    @patch('vllm.forward_context._forward_context',
+           new_callable=lambda: MagicMock(spec=ForwardContext))
+    @patch("vllm.config.get_current_vllm_config")
+    def test_input_not_parallel(self, vllm_config, mock_forward_context):
+        vllm_config.parallel_config.enable_sequence_parallel = False
+        mock_forward_context.attn_metadata = None
         layer = AscendMlpRowParallelLinear(input_size=16,
                                            output_size=8,
                                            input_is_parallel=False)
