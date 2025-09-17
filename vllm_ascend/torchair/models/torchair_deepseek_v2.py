@@ -74,7 +74,7 @@ from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.torchair.ops.torchair_fused_moe import TorchairAscendFusedMoE
 from vllm_ascend.torchair.quantization.torchair_w8a8_dynamic import \
     TorchairAscendW8A8DynamicLinearMethod
-from vllm_ascend.utils import dispose_tensor, npu_prefetch
+from vllm_ascend.utils import dispose_tensor, npu_prefetch, oproj_tp_enable
 
 
 class TorchairDeepseekV2SiluAndMul(SiluAndMul):
@@ -514,11 +514,18 @@ class TorchairDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj")
-        if (config.n_routed_experts is not None
-                and self.debug_layer_idx >= config.first_k_dense_replace
-                and self.debug_layer_idx % config.moe_layer_freq == 0
-                and (ascend_config.torchair_graph_config.enable_multistream_moe
-                     or self.enable_shared_expert_dp)):
+
+        if oproj_tp_enable():
+            self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
+                                            self.hidden_size,
+                                            bias=False,
+                                            quant_config=quant_config,
+                                            prefix=f"{prefix}.o_proj")
+        elif (config.n_routed_experts is not None
+              and self.debug_layer_idx >= config.first_k_dense_replace
+              and self.debug_layer_idx % config.moe_layer_freq == 0
+              and (ascend_config.torchair_graph_config.enable_multistream_moe
+                   or self.enable_shared_expert_dp)):
             self.o_proj = TorchairDeepseekV2RowParallelLinearReplaceAllreduce(
                 self.num_heads * self.v_head_dim,
                 self.hidden_size,
@@ -921,6 +928,8 @@ class TorchairDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.num_dense_layers = self.config.first_k_dense_replace
+        self.num_moe_layers = self.config.num_hidden_layers - self.num_dense_layers
         self.quant_config = quant_config
         self.model = TorchairDeepseekV2Model(vllm_config=vllm_config,
                                              prefix=maybe_prefix(

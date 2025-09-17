@@ -215,21 +215,6 @@ class TestAscendConfig(TestBase):
             test_vllm_config.model_config = fake_model_config
             init_ascend_config(test_vllm_config)
             check_ascend_config(test_vllm_config, False)
-        # aclgraph + deepseek model
-        with self.assertRaises(NotImplementedError):
-            test_vllm_config.additional_config = {
-                "torchair_graph_config": {
-                    "enabled": False,
-                },
-                "refresh": True
-            }
-            model_path = os.path.join(os.path.dirname(__file__), "fake_weight")
-            fake_model_config = ModelConfig(model=model_path)
-            fake_model_config.hf_config = PretrainedConfig()
-            fake_model_config.hf_config.model_type = "deepseek"
-            test_vllm_config.model_config = fake_model_config
-            init_ascend_config(test_vllm_config)
-            check_ascend_config(test_vllm_config, False)
 
     def test_check_torchair_supported(self):
         test_cases = [('deepseek_v3', True), ('PanguProMoE', True),
@@ -358,4 +343,28 @@ class TestAscendConfig(TestBase):
             }
             test_vllm_config.parallel_config = ParallelConfig(
                 data_parallel_size=4, tensor_parallel_size=2)
+            init_ascend_config(test_vllm_config)
+
+        with self.assertRaises(AssertionError):
+            test_vllm_config.additional_config = {
+                "torchair_graph_config": {
+                    "enabled": True,
+                },
+                "oproj_tensor_parallel_size": 2,
+                "refresh": True
+            }
+            test_vllm_config.parallel_config = ParallelConfig(
+                data_parallel_size=4, tensor_parallel_size=2)
+            init_ascend_config(test_vllm_config)
+
+        with self.assertRaises(AssertionError):
+            test_vllm_config.additional_config = {
+                "torchair_graph_config": {
+                    "enabled": False,
+                },
+                "oproj_tensor_parallel_size": 2,
+                "refresh": True
+            }
+            test_vllm_config.parallel_config = ParallelConfig(
+                data_parallel_size=4, tensor_parallel_size=1)
             init_ascend_config(test_vllm_config)
