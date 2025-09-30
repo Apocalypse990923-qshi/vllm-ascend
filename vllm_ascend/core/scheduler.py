@@ -51,6 +51,13 @@ class AscendScheduler(Scheduler):
                          include_finished_set, log_stats)
         self.scheduled_req_ids: set[str] = set()
         self.running: list[Request] = []
+        self.cp_size = vllm_config.parallel_config.context_parallel_size
+        try:
+            from vllm.distributed.parallel_state import get_dcp_group
+            self.dcp_size = get_dcp_group().world_size
+        except (ImportError, AssertionError):
+            self.dcp_size = 1
+        self.cp_dcp_size = self.cp_size * self.dcp_size
 
         self.finished_prefill_reqs: deque[Request] = deque()
         enable_pd_transfer = getattr(self.scheduler_config,
@@ -62,8 +69,10 @@ class AscendScheduler(Scheduler):
                                                decode_max_num_seqs)
 
     def schedule(self) -> SchedulerOutput:
-        if self.scheduler_config.chunked_prefill_enabled:
+        if self.scheduler_config.chunked_prefill_enabled and self.cp_dcp_size <= 1:
+            # Delegate to parent for single-rank chunked prefill
             return super().schedule()
+        chunked_prefill = self.scheduler_config.chunked_prefill_enabled
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -174,7 +183,11 @@ class AscendScheduler(Scheduler):
                 # We use `request.num_tokens` instead of
                 # `request.num_prompt_tokens` to consider the resumed
                 # requests, which have output tokens.
-                num_new_tokens = request.num_tokens - num_computed_tokens
+                if chunked_prefill:
+                    # In chunked prefill with cp/dcp, num_new_tokens was already computed
+                    num_new_tokens = min(request.num_tokens - num_computed_tokens, token_budget)
+                else:
+                    num_new_tokens = request.num_tokens - num_computed_tokens
                 max_tokens_in_kvcache = (self.kv_cache_config.num_blocks *
                                          self.block_size)
                 prompt_limit = min(prompt_limit, max_tokens_in_kvcache)
@@ -286,6 +299,66 @@ class AscendScheduler(Scheduler):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.extendleft(skipped_waiting_requests)
+
+        # Continue chunked prefill for running requests that haven't finished prefill
+        # Note: Token distribution across CP/DCP ranks is handled in model_runner
+        if chunked_prefill and token_budget > 0 and self.cp_dcp_size > 1:
+            req_index = 0
+            while req_index < len(self.running) and token_budget > 0:
+                request = self.running[req_index]
+                if request.request_id in self.scheduled_req_ids:
+                    req_index += 1
+                    continue
+
+                # Check if still in prefill phase (remaining tokens > 1)
+                remaining_tokens = request.num_tokens - request.num_computed_tokens
+                if remaining_tokens <= 1:
+                    req_index += 1
+                    continue
+
+                # Schedule next chunk within budget
+                num_new_tokens = min(remaining_tokens, token_budget)
+                prompt_limit = self._get_prompt_limit(request)
+                num_new_tokens = min(num_new_tokens, prompt_limit)
+                if num_new_tokens <= 0:
+                    req_index += 1
+                    continue
+
+                # Allocate KV slots
+                while True:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_lookahead_tokens=self.num_lookahead_tokens)
+                    if new_blocks is None:
+                        # Preempt lowest priority request
+                        preempted_req = self.running.pop()
+                        self.kv_cache_manager.free(preempted_req)
+                        preempted_req.status = RequestStatus.PREEMPTED
+                        preempted_req.num_computed_tokens = 0
+                        if self.log_stats:
+                            preempted_req.record_event(
+                                EngineCoreEventType.PREEMPTED,
+                                scheduled_timestamp)
+                        self.waiting.appendleft(preempted_req)
+                        preempted_reqs.append(preempted_req)
+                        if preempted_req == request:
+                            num_new_tokens = 0
+                            break
+                    else:
+                        break
+
+                if num_new_tokens == 0:
+                    req_index += 1
+                    continue
+
+                # Record scheduling
+                scheduled_running_reqs.append(request)
+                self.scheduled_req_ids.add(request.request_id)
+                req_to_new_blocks[request.request_id] = new_blocks
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                req_index += 1
 
         if self.phase == "decode":
             while len(
@@ -513,8 +586,8 @@ class AscendScheduler(Scheduler):
         return True
 
     def _get_prompt_limit(self, request: Request) -> int:
-        if (self.scheduler_config.chunked_prefill_enabled
-                and not self.scheduler_config.is_multi_step):
+        if (self.scheduler_config.chunked_prefill_enabled):
+                #and not self.scheduler_config.is_multi_step):
             prompt_limit = self.scheduler_config.max_model_len
         else:
             prompt_limit = min(

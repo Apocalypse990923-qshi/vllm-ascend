@@ -108,6 +108,10 @@ class AscendMLAPrefillMetadata:
     tail_attn_nomask_seqlens: torch.Tensor = None
     q_full_idx: torch.Tensor = None
     cp_prefill_mask: torch.Tensor = None
+    num_computed_tokens_of_cp_sp: Optional[list[Optional[list[Optional[list[int]]]]]] = None
+    num_computed_tokens_of_cp_sp_single: Optional[list[Optional[list[Optional[list[int]]]]]] = None
+    num_computed_tokens_of_cp_sp_current: Optional[list[Optional[list[Optional[list[int]]]]]] = None
+    num_computed_tokens_of_cp_sp_accum: Optional[list[Optional[list[Optional[list[int]]]]]] = None
 
 
 @dataclass
@@ -124,6 +128,12 @@ class AscendMLADecodeMetadata:
     sin: torch.Tensor = None
     cos: torch.Tensor = None
     num_computed_tokens_of_cp_sp: Optional[list[Optional[list[Optional[
+        list[int]]]]]] = None
+    num_computed_tokens_of_cp_sp_single: Optional[list[Optional[list[Optional[
+        list[int]]]]]] = None
+    num_computed_tokens_of_cp_sp_current: Optional[list[Optional[list[Optional[
+        list[int]]]]]] = None
+    num_computed_tokens_of_cp_sp_accum: Optional[list[Optional[list[Optional[
         list[int]]]]]] = None
 
 
@@ -330,6 +340,9 @@ class AscendMLAMetadataBuilder:
         tail_attn_nomask_seqlens = long_seq_metadata.tail_attn_nomask_seqlens if long_seq_metadata else None
         q_full_idx = long_seq_metadata.q_full_idx if long_seq_metadata else None
         cp_prefill_mask = long_seq_metadata.cp_prefill_mask if long_seq_metadata else None
+        num_computed_tokens_of_cp_sp_single = long_seq_metadata.num_computed_tokens_of_cp_sp_single if long_seq_metadata else None
+        num_computed_tokens_of_cp_sp_current = long_seq_metadata.num_computed_tokens_of_cp_sp_current if long_seq_metadata else None
+        num_computed_tokens_of_cp_sp_accum = long_seq_metadata.num_computed_tokens_of_cp_sp_accum if long_seq_metadata else None
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = \
             split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold)
@@ -440,7 +453,11 @@ class AscendMLAMetadataBuilder:
                 head_attn_nomask_seqlens=head_attn_nomask_seqlens,
                 tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
                 q_full_idx=q_full_idx,
-                cp_prefill_mask=cp_prefill_mask
+                cp_prefill_mask=cp_prefill_mask,
+                num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp,
+                num_computed_tokens_of_cp_sp_single=num_computed_tokens_of_cp_sp_single,
+                num_computed_tokens_of_cp_sp_current=num_computed_tokens_of_cp_sp_current,
+                num_computed_tokens_of_cp_sp_accum=num_computed_tokens_of_cp_sp_accum
             )
 
         decode_metadata = None
@@ -468,7 +485,10 @@ class AscendMLAMetadataBuilder:
                 actual_seq_lengths_q=actual_seq_lengths_q,
                 sin=sin,
                 cos=cos,
-                num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp)
+                num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp,
+                num_computed_tokens_of_cp_sp_single=num_computed_tokens_of_cp_sp_single,
+                num_computed_tokens_of_cp_sp_current=num_computed_tokens_of_cp_sp_current,
+                num_computed_tokens_of_cp_sp_accum=num_computed_tokens_of_cp_sp_accum)
 
         return self.metadata_cls(  # type: ignore
             num_actual_tokens=num_actual_tokens,
@@ -578,6 +598,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.tp_group = get_tp_group(
         ).device_group if self.tp_size > 1 else None
 
+        # Step indices for chunked prefill tracking
+        self._prefill_step_idx: int = 0
+        self._decode_step_idx: int = 0
+
     def _v_up_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
@@ -677,57 +701,292 @@ class AscendMLAImpl(MLAAttentionImpl):
         cache_k_pe = kv_c_and_k_pe_cache[1]
         num_heads = cache_k_pe.size(2)
         latent_kv_dim = kv_c_and_k_pe_cache[0].size(-1)
-        for i in range(iters):
-            toks = prefill_metadata.chunked_context.seq_tot[i]
+        # token -> request mapping for building per-token masks when CP>1
+        num_tokens_all = q_nope.size(0)
+        seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32, device=q_nope.device).contiguous()
 
-            seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i]
-            seq_len = torch.stack([seq_len1, seq_len2])
-            kv_c_normed = torch.empty(toks,
-                                      num_heads,
-                                      latent_kv_dim,
-                                      dtype=q_nope.dtype,
-                                      device=q_nope.device)
-            k_pe = torch.empty(toks,
-                               num_heads,
-                               rope_dim,
-                               dtype=q_nope.dtype,
-                               device=q_nope.device)
+        # normalize prefix LSE to [bs, heads, 1] for stable updates
+        prefix_lse_bt = prefix_lse.permute(1, 0).unsqueeze(-1).contiguous() if prefix_lse is not None else None
 
-            torch_npu.atb.npu_paged_cache_load(
-                cache_kv_c,
-                cache_k_pe,
-                prefill_metadata.block_table,
-                seq_len2.to(q_nope.device),
-                seq_starts=prefill_metadata.chunked_context.starts[i],
-                key=kv_c_normed,
-                value=k_pe,
+        if self.cp_size > 1:
+            req_ids = torch.repeat_interleave(
+                torch.arange(seq_len1.numel(), device=q_nope.device, dtype=torch.long),
+                seq_len1.to(torch.long).to(q_nope.device)
             )
 
+        # Select mask: prefer CP prefill mask from metadata; fallback to cached prefill_mask; create if needed.
+        mask_local = None
+        if attn_metadata is not None and attn_metadata.prefill is not None and \
+                attn_metadata.prefill.cp_prefill_mask is not None:
+            mask_local = attn_metadata.prefill.cp_prefill_mask
+            logger.info(f"||||||====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
+        else:
+            mask_local = self.prefill_mask
+            if mask_local is None:
+                mask_local = torch.triu(
+                    torch.ones(512, 512, device=q_nope.device, dtype=q_nope.dtype), 1)
+                self.prefill_mask = mask_local
+            logger.info(f"+++++++====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
+
+        # Keep the causal mask; do not override to all-ones.
+        num_computed_tokens_of_cp_sp_accum = attn_metadata.prefill.num_computed_tokens_of_cp_sp_accum
+
+        for i in range(iters):
+            if self.cp_size * self.dcp_size > 1:
+                ## DCP mode: each rank processes its own (cp,dcp) historical context slice per request dimension
+                seq_len2_all = prefill_metadata.chunked_context.chunk_seq_lens[i]
+                num_requests = len(seq_len2_all)
+
+                ## Calculate tokens each rank should process per request
+                seq_len2_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
+                context_starts_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
+                total_toks = 0
+
+                for req_idx in range(num_requests):
+                    n_computed_acc = num_computed_tokens_of_cp_sp_accum[req_idx][i]
+                    total_toks += n_computed_acc[self.cp_rank][self.dcp_rank]
+                    seq_len2_rank[req_idx] = n_computed_acc[self.cp_rank][self.dcp_rank]
+
+                if total_toks > 0:
+                    kv_c_normed = torch.empty(total_toks,
+                                              num_heads,
+                                              latent_kv_dim,
+                                              dtype=q_nope.dtype,
+                                              device=q_nope.device)
+                    k_pe = torch.empty(total_toks,
+                                       num_heads,
+                                       rope_dim,
+                                       dtype=q_nope.dtype,
+                                       device=q_nope.device)
+
+                    torch_npu.atb.npu_paged_cache_load(
+                        cache_kv_c,
+                        cache_k_pe,
+                        prefill_metadata.block_table,
+                        seq_len2_rank.to(q_nope.device),
+                        seq_starts=prefill_metadata.chunked_context.starts[i],
+                        key=kv_c_normed,
+                        value=k_pe,
+                    )
+                    seq_len2 = seq_len2_rank.to(q_nope.device)
+                else:
+                    # If current rank has no tokens to process, create empty tensors
+                    kv_c_normed = torch.empty(0, num_heads, latent_kv_dim,
+                                              dtype=q_nope.dtype, device=q_nope.device)
+                    k_pe = torch.empty(0, num_heads, rope_dim,
+                                       dtype=q_nope.dtype, device=q_nope.device)
+                    seq_len2 = torch.zeros((len(seq_len2_all),), dtype=torch.int32, device=q_nope.device)
+            else:
+                # Original logic: CP-only mode
+                toks = prefill_metadata.chunked_context.seq_tot[i]
+                seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i].to(q_nope.device, dtype=torch.int32).contiguous()
+
+                kv_c_normed = torch.empty(toks,
+                                          num_heads,
+                                          latent_kv_dim,
+                                          dtype=q_nope.dtype,
+                                          device=q_nope.device)
+                k_pe = torch.empty(toks,
+                                   num_heads,
+                                   rope_dim,
+                                   dtype=q_nope.dtype,
+                                   device=q_nope.device)
+
+                torch_npu.atb.npu_paged_cache_load(
+                    cache_kv_c,
+                    cache_k_pe,
+                    prefill_metadata.block_table,
+                    seq_len2,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                    key=kv_c_normed,
+                    value=k_pe,
+                )
+
+            seq_len = torch.stack([seq_len1.cpu(), seq_len2.cpu()])
+            logger.info(f'----> cp={self.cp_rank},dcp={self.dcp_rank},{seq_len2_all=},{total_toks=},{num_computed_tokens_of_cp_sp_accum=}')
+
             kv_c_normed = kv_c_normed.squeeze()
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view( \
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = kv_nope\
-                .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
-            torch_npu.atb.npu_ring_mla(
-                q_nope=q_nope,
-                q_rope=q_pe,
-                k_nope=k_nope,
-                k_rope=k_pe,
-                value=v,
-                mask=self.prefill_mask,
-                seqlen=seq_len,
-                head_num=self.num_heads,
-                kv_head_num=self.num_heads,
-                pre_out=prefix_output,
-                prev_lse=prefix_lse,
-                qk_scale=self.scale,
-                kernel_type="kernel_type_high_precision",
-                mask_type="no_mask",
-                input_layout="type_bsnd",
-                calc_type="calc_type_default",
-                output=prefix_output,
-                softmax_lse=prefix_lse)
+            if self.dcp_size > 1:
+                # DCP mode: first all_gather within DCP group, let each rank in CP group share complete sequence blocks
+                # Step 1: DCP all_gather latent
+                kv_c_k_pe_local = torch.cat([kv_c_normed, k_pe.squeeze()], dim=-1)  # [local_toks, latent_dim + rope_dim]
+
+                kv_c_k_pe_gather_list = [torch.empty_like(kv_c_k_pe_local) for _ in range(self.dcp_size)]
+                dist.all_gather(kv_c_k_pe_gather_list, kv_c_k_pe_local, group=self.dcp_group)
+
+                # Step 2: concatenate all DCP ranks' data in sequence dimension
+                kv_c_k_pe_full = torch.cat(kv_c_k_pe_gather_list, dim=0)  # [total_dcp_toks, latent_dim + rope_dim]
+
+                kv_c_normed_full, k_pe_full = torch.split(kv_c_k_pe_full, [latent_kv_dim, rope_dim], dim=-1)
+
+                # Step 3: process complete sequence with TP projection to get current rank's head slice
+                kv_nope = self.kv_b_proj(kv_c_normed_full)[0].view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+                k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+                k_pe = k_pe_full.unsqueeze(1).expand((*k_nope.shape[:-1], -1))
+            else:
+                # Non-DCP mode: use TP-split projection
+                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+                k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+                k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
+            logger.info("--->here")
+            if self.cp_size * self.dcp_size > 1:
+                # CP+DCP mode: first compute this rank's contribution to the chunk
+                block_out_local = torch.empty(
+                    num_tokens_all, self.num_heads, self.v_head_dim,
+                    dtype=q_nope.dtype, device=q_nope.device)
+                block_lse_local = torch.empty(
+                    self.num_heads, num_tokens_all,
+                    dtype=torch.float32, device=q_nope.device)
+                logger.info(f"--->here---,cp={self.cp_rank},dcp={self.dcp_rank}, cache_kv_c.shape:{cache_kv_c.shape},cache_k_pe.shape:{cache_k_pe.shape}, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
+                            f"value:{v.shape}, seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
+                            f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
+
+                if self._dump_enabled():
+                    _dump_step = self._prefill_step_idx
+                    prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
+                    prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
+                    prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
+                    prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
+                    prefill_value_0 = v.detach().cpu().to(torch.float32)
+                    prefill_block_table_0 = prefill_metadata.block_table.detach().cpu()
+                    self._maybe_dump_pickle(
+                        tag="kv_prefill_context_before_mla",
+                        payload={
+                            "layer_id": self.layer_id,
+                            "cp_rank": int(self.cp_rank),
+                            "prefill_q_nope": prefill_q_nope_0.numpy(),
+                            "prefill_q_pe": prefill_q_pe_0.numpy(),
+                            "prefill_k_nope": prefill_k_nope_0.numpy(),
+                            "prefill_k_pe": prefill_k_pe_0.numpy(),
+                            "prefill_value": prefill_value_0.numpy(),
+                            "prefill_block_table":prefill_block_table_0.numpy(),
+                        },
+                        step=_dump_step,
+                    )
+
+                torch_npu.atb.npu_ring_mla(
+                    q_nope=q_nope,
+                    q_rope=q_pe,
+                    k_nope=k_nope,
+                    k_rope=k_pe,
+                    value=v,
+                    mask=mask_local,
+                    seqlen=seq_len,
+                    head_num=self.num_heads,
+                    kv_head_num=self.num_heads,
+                    qk_scale=self.scale,
+                    kernel_type="kernel_type_high_precision",
+                    mask_type="no_mask",
+                    input_layout="type_bsnd",
+                    calc_type="calc_type_first_ring",
+                    output=block_out_local,
+                    softmax_lse=block_lse_local)
+
+                # CP dimension fusion (SP already handled above)
+                def _update_out_and_lse(out, lse, block_out, block_lse, token_mask=None):
+                    if out is None:
+                        out = block_out.to(torch.float32)
+                        lse = block_lse
+                    else:
+                        if token_mask is None:
+                            token_mask = torch.ones([block_out.size(0)], dtype=torch.uint8, device=block_out.device)
+
+                        out_mask = token_mask[:, None, None].expand_as(block_out)
+                        lse_mask = token_mask[:, None, None].expand_as(block_lse)
+                        block_out = block_out.to(torch.float32)
+                        out_wo = out.clone()
+                        lse_wo = lse.clone()
+                        logger.info(f"---->here, out shape:{out.shape}, lse shape:{lse.shape}, block_out:{block_out.shape}, block lse:{block_lse.shape}")
+
+                        out = out - F.sigmoid(block_lse - lse) * (out - block_out)
+                        lse = lse - F.logsigmoid(lse - block_lse)
+                        out = torch.where(out_mask, out, out_wo)
+                        lse = torch.where(lse_mask, lse, lse_wo)
+                    return out, lse
+
+                logger.info(f"--->here, out shape:{block_out_local.shape}, block_lse_local shape:{block_lse_local.shape}")
+
+                block_lse_local_bt = block_lse_local.permute(1, 0).unsqueeze(-1)
+                out_lse_local = torch.cat([block_out_local, block_lse_local_bt], dim=-1)
+
+                # CP dimension all_gather and fusion
+                out_lse_list = [torch.empty_like(out_lse_local) for _ in range(self.cp_size)]
+                dist.all_gather(out_lse_list, out_lse_local, group=self.cp_group)
+                chunk_out_g = None
+                chunk_lse_g = None
+                for r in range(self.cp_size):
+                    logger.info("--->here")
+                    out_lse_r = out_lse_list[r]
+                    logger.info("--->here")
+                    out_r, lse_r = torch.split(out_lse_r, [self.v_head_dim, 1], dim=-1)
+                    logger.info(f"--->here, out_r shape:{out_r.shape}, lse_r.shape:{lse_r.shape}")
+                    # DCP mode: each rank processed the full DCP sequence, use simplified mask
+                    if self.dcp_size > 1:
+                        token_mask = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)
+                    else:
+                        # Non-DCP mode uses original logic
+                        mask_req = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)  # simplified handling
+                        token_mask = mask_req
+                    chunk_out_g, chunk_lse_g = self._update_out_and_lse(
+                        chunk_out_g, chunk_lse_g, out_r, lse_r, token_mask)
+                    logger.info(f"######, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}")
+                if chunk_out_g is not None:
+                    if prefix_lse_bt is None:
+                        prefix_output = chunk_out_g.to(torch.float32)
+                        prefix_lse_bt = chunk_lse_g
+                    else:
+                        logger.info(f"--->here, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}, prefix shape:{prefix_output.shape},{prefix_lse_bt.shape}")
+
+                        prefix_output, prefix_lse_bt = self._update_out_and_lse(
+                            prefix_output, prefix_lse_bt, chunk_out_g, chunk_lse_g)
+                logger.info(
+                    f"#####> [MLA-CTX-CP] it={i}  q_nope.shape={q_nope.shape} k_nope.shape={k_nope.shape} "
+                    f"v.shape={v.shape} out_local.shape={block_out_local.shape} lse_local.shape={block_lse_local.shape}")
+
+            else:
+                # compute this chunk block then update prefix tensors to keep shapes consistent
+                block_out_local2 = torch.empty(
+                    num_tokens_all, self.num_heads, self.v_head_dim,
+                    dtype=q_nope.dtype, device=q_nope.device)
+                block_lse_local2 = torch.empty(
+                    self.num_heads, num_tokens_all,
+                    dtype=torch.float32, device=q_nope.device)
+                torch_npu.atb.npu_ring_mla(
+                    q_nope=q_nope,
+                    q_rope=q_pe,
+                    k_nope=k_nope,
+                    k_rope=k_pe,
+                    value=v,
+                    mask=mask_local,
+                    seqlen=seq_len,
+                    head_num=self.num_heads,
+                    kv_head_num=self.num_heads,
+                    pre_out=None,
+                    prev_lse=None,
+                    qk_scale=self.scale,
+                    kernel_type="kernel_type_high_precision",
+                    mask_type="no_mask",
+                    input_layout="type_bsnd",
+                    calc_type="calc_type_default",
+                    output=block_out_local2,
+                    softmax_lse=block_lse_local2)
+                block_lse_local_bt2 = block_lse_local2.permute(1, 0).unsqueeze(-1)
+
+
+                if prefix_lse_bt is None:
+                    prefix_output = block_out_local2.to(torch.float32)
+                    prefix_lse_bt = block_lse_local_bt2
+                else:
+                    prefix_output, prefix_lse_bt = self._update_out_and_lse(
+                        prefix_output, prefix_lse_bt, block_out_local2, block_lse_local_bt2)
+                logger.info(
+                    f"#####> [MLA-CTX] it={i} toks={toks} q_nope.shape={q_nope.shape} k_nope.shape={k_nope.shape} v.shape={v.shape} "
+                    f"prefix_out.shape={prefix_output.shape} prefix_lse.shape={prefix_lse_bt.shape}")
+        # convert lse back to [heads, bs]
+        if prefix_lse_bt is not None:
+            prefix_lse = prefix_lse_bt.squeeze(-1).permute(1, 0).contiguous()
         return prefix_output, prefix_lse
 
     def _forward_prefill(
@@ -1109,6 +1368,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     current_ms_metadata.after_comm_event.record()
             else:
                 o_proj_input[:num_decode_tokens] = output_decode
+            # Increment decode step counter for chunked prefill tracking
+            self._decode_step_idx += 1
 
         if prefill_preprocess_res is not None:
             # FIX: aicore move should be also placed on the comm stream in dbo,
@@ -1131,6 +1392,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     current_ms_metadata.after_comm_event.record()
             else:
                 o_proj_input[num_decode_tokens:] = output_prefill
+            # Increment prefill step counter for chunked prefill tracking
+            self._prefill_step_idx += 1
         # O proj
         current_ms_metadata = get_multistream_comm_context()
         MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
@@ -1186,7 +1449,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         tail_attn_nomask_seqlens = attn_metadata.prefill.tail_attn_nomask_seqlens
         mask = attn_metadata.prefill.cp_prefill_mask
 
-        output_head = self._attention_with_mask_and_nomask(
+        output_head, head_lse = self._attention_with_mask_and_nomask(
             q_nope=torch.index_select(q_nope, 0, q_head_idx),
             q_pe=torch.index_select(q_pe, 0, q_head_idx),
             k_nope=k_nope,
@@ -1198,7 +1461,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             attn_nomask_seqlens=head_attn_nomask_seqlens,
             mask=mask)
 
-        output_tail = self._attention_with_mask_and_nomask(
+        output_tail, tail_lse = self._attention_with_mask_and_nomask(
             q_nope=torch.index_select(q_nope, 0, q_tail_idx),
             q_pe=torch.index_select(q_pe, 0, q_tail_idx),
             k_nope=k_nope,
@@ -1214,7 +1477,31 @@ class AscendMLAImpl(MLAAttentionImpl):
         output = torch.index_select(
             torch.cat([output_head, output_tail], dim=0), 0, q_full_idx)
 
-        output = output.reshape([num_tokens, self.num_heads * self.v_head_dim])
+        # Synchronize and reorder LSE for subsequent chunked context accumulation
+        attn_lse = torch.cat([head_lse, tail_lse], dim=1)
+        attn_lse = attn_lse[:, q_full_idx]
+
+        # Post-processing: keep [tokens, H, V] shape and perform chunked context accumulation if needed
+        if attn_metadata.prefill is not None and \
+                attn_metadata.prefill.chunked_context is not None:
+            attn_output_pre = output.view(num_tokens, self.num_heads, self.v_head_dim)
+            attn_output_pre, attn_lse = self._compute_prefill_context(
+                q_nope,
+                q_pe,
+                kv_c_and_k_pe_cache,
+                self.qk_rope_head_dim,
+                attn_metadata,
+                attn_output_pre,
+                attn_lse,
+            )
+            attn_output_pre = attn_output_pre.to(q_nope.dtype)
+            output = attn_output_pre.reshape([
+                num_tokens, self.num_heads * self.v_head_dim
+            ])
+        else:
+            output = output.reshape([
+                num_tokens, self.num_heads * self.v_head_dim
+            ])
 
         return output
 
@@ -1259,7 +1546,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         # nomask
         if kv_nomask_idx.shape[0] == 0:
-            return attn_output
+            return attn_output, attn_lse
 
         k_nope_nomask = torch.index_select(k_nope, 0, kv_nomask_idx)
         value_nomask = torch.index_select(value, 0, kv_nomask_idx)
@@ -1282,7 +1569,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                    calc_type="calc_type_default",
                                    output=attn_output,
                                    softmax_lse=attn_lse)
-        return attn_output
+        return attn_output, attn_lse
 
     def _forward_decode_sp(
         self,

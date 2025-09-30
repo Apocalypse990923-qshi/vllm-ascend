@@ -520,6 +520,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                                      dtype=torch.int64)
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs,
                                                   dtype=torch.int32)
+        self.request_computed_tokens_dict: Dict[str, int] = {}
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
@@ -621,7 +622,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             else:
                 backward_kwargs["mm_features"] = new_req_data.mm_features
 
-            self.requests[req_id] = CachedRequestState(
+            # Create request state - CP/DCP tracking will be computed below
+            req_state = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 sampling_params=sampling_params,
@@ -631,8 +633,31 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                num_computed_tokens_of_cp_sp=None,
+                num_computed_tokens_of_cp_sp_single=None,
+                num_computed_tokens_of_cp_sp_current=None,
+                num_computed_tokens_of_cp_sp_accum=None,
                 **backward_kwargs,
             )
+            
+            # Compute CP/DCP tracking fields for chunked prefill
+            if self.cp_size * self.dcp_size > 1:
+                num_computed_tokens = new_req_data.num_computed_tokens
+                # Compute token distribution
+                current_distribution = self.input_batch.block_table.get_split_computed_tokens(
+                    np.array([num_computed_tokens]))[0]
+                req_state.num_computed_tokens_of_cp_sp = current_distribution
+                req_state.num_computed_tokens_of_cp_sp_current = current_distribution
+                req_state.num_computed_tokens_of_cp_sp_single = [
+                    [current_distribution[cp][dcp] for dcp in range(self.dcp_size)]
+                    for cp in range(self.cp_size)
+                ]
+                import copy
+                req_state.num_computed_tokens_of_cp_sp_accum = [
+                    copy.deepcopy(current_distribution)
+                ]
+            
+            self.requests[req_id] = req_state
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
@@ -653,7 +678,48 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             resumed_from_preemption = req_data.resumed_from_preemption[i]
 
             # Update the cached states.
+            prev_num_computed_tokens = req_state.num_computed_tokens
             req_state.num_computed_tokens = num_computed_tokens
+            
+            # Compute CP/DCP tracking fields for chunked prefill
+            if self.cp_size * self.dcp_size > 1:
+                # Compute current token distribution
+                current_distribution = self.input_batch.block_table.get_split_computed_tokens(
+                    np.array([num_computed_tokens]))[0]
+                req_state.num_computed_tokens_of_cp_sp = current_distribution
+                
+                # If this is the first chunk, initialize tracking fields
+                if req_state.num_computed_tokens_of_cp_sp_single is None:
+                    req_state.num_computed_tokens_of_cp_sp_single = [[0] * self.dcp_size for _ in range(self.cp_size)]
+                    req_state.num_computed_tokens_of_cp_sp_accum = []
+                
+                # Compute what changed since last step (the "current chunk")
+                if prev_num_computed_tokens > 0:
+                    prev_distribution = self.input_batch.block_table.get_split_computed_tokens(
+                        np.array([prev_num_computed_tokens]))[0]
+                    req_state.num_computed_tokens_of_cp_sp_current = [
+                        [current_distribution[cp][dcp] - prev_distribution[cp][dcp]
+                         for dcp in range(self.dcp_size)]
+                        for cp in range(self.cp_size)
+                    ]
+                else:
+                    # First chunk - everything is new
+                    req_state.num_computed_tokens_of_cp_sp_current = [
+                        [current_distribution[cp][dcp] for dcp in range(self.dcp_size)]
+                        for cp in range(self.cp_size)
+                    ]
+                
+                # Accumulate per-rank totals
+                for cp in range(self.cp_size):
+                    for dcp in range(self.dcp_size):
+                        req_state.num_computed_tokens_of_cp_sp_single[cp][dcp] += \
+                            req_state.num_computed_tokens_of_cp_sp_current[cp][dcp]
+                
+                # Record this chunk's distribution
+                import copy
+                req_state.num_computed_tokens_of_cp_sp_accum.append(
+                    copy.deepcopy(req_state.num_computed_tokens_of_cp_sp_current)
+                )
 
             if not is_last_rank:
                 # When using PP, the scheduler sends the sampled tokens back,
@@ -698,6 +764,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(
                     new_block_ids, req_index)
+            
+            # Update CP/DCP tracking fields in input_batch
+            self.input_batch.num_computed_tokens_of_cp_sp[req_index] = req_state.num_computed_tokens_of_cp_sp
+            self.input_batch.num_computed_tokens_of_cp_sp_single[req_index] = req_state.num_computed_tokens_of_cp_sp_single
+            self.input_batch.num_computed_tokens_of_cp_sp_current[req_index] = req_state.num_computed_tokens_of_cp_sp_current
+            self.input_batch.num_computed_tokens_of_cp_sp_accum[req_index] = req_state.num_computed_tokens_of_cp_sp_accum
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
@@ -1256,6 +1328,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        logger.info(f"**** number of scheduled tokens: {total_num_scheduled_tokens}****")
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -3792,7 +3865,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 cp_kv_recover_idx=self.cp_kv_recover_idx,
                 num_actual_tokens_cp_full=num_actual_tokens_cp_full,
                 num_computed_tokens_of_cp_sp=self.input_batch.block_table.get_split_computed_tokens(
-                    self.input_batch.num_computed_tokens_cpu[:self.input_batch.num_reqs]),
+                    self.input_batch.num_computed_tokens_cpu[:self.input_batch.num_reqs],
+                    self.input_batch.req_ids,
+                    self.request_computed_tokens_dict
+                    ),
+                num_computed_tokens_of_cp_sp_single=self.input_batch.num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp_current=self.input_batch.num_computed_tokens_of_cp_sp_current[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp_accum=self.input_batch.num_computed_tokens_of_cp_sp_accum[:self.input_batch.num_reqs],
                 q_head_idx_tensor=self.q_head_idx_tensor,
                 q_tail_idx_tensor=self.q_tail_idx_tensor,
                 q_full_idx=self.q_full_idx,
@@ -3814,7 +3893,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         else:
             long_seq_metadata = AscendCommonLongSequenceMetadata(
                 num_actual_tokens_cp_full=num_actual_tokens_cp_full,
-                num_computed_tokens_of_cp_sp=self.input_batch.block_table.get_split_computed_tokens(
-                    self.input_batch.num_tokens[:self.input_batch.num_reqs]), )
+                num_computed_tokens_of_cp_sp=self.input_batch.block_table.get_split_computed_tokens( #TODO(wzliu): 这里似乎要求rank分配是连续的
+                    self.input_batch.num_tokens[:self.input_batch.num_reqs]),
+                num_computed_tokens_of_cp_sp_single=self.input_batch.num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp_current=self.input_batch.num_computed_tokens_of_cp_sp_current[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp_accum=self.input_batch.num_computed_tokens_of_cp_sp_accum[:self.input_batch.num_reqs],
+            )
 
         return long_seq_metadata
