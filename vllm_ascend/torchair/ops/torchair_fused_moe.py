@@ -44,13 +44,14 @@ from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import (determine_default_expert_map,
                                               determine_default_log2phy_map)
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
-from vllm_ascend.ops.sequence_parallel import MetadataForPadding
 from vllm_ascend.quantization.quant_config import AscendFusedMoEMethod
+from vllm_ascend.torchair.ops.sequence_parallel import MetadataForPadding
 from vllm_ascend.torchair.utils import npu_stream_switch, npu_wait_tensor
 from vllm_ascend.utils import (AscendSocVersion, dispose_tensor,
                                get_all_reduce_merge_state,
                                get_ascend_soc_version,
-                               get_rm_router_logits_state, is_310p)
+                               get_rm_router_logits_state, is_310p,
+                               vllm_version_is)
 
 
 def torchair_fused_experts_with_mc2(
@@ -802,6 +803,7 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         ascend_config = get_ascend_config()
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
+        self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
 
         try:
             device_group = get_mc2_group().device_group
@@ -883,6 +885,8 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             topk_ids = torch.randint_like(topk_ids, 0, global_num_experts)
 
         fused_moe_state = get_forward_context().fused_moe_state
+        if self.enable_shared_expert_dp and fused_moe_state == FusedMoEState.MC2:
+            fused_moe_state = FusedMoEState.All2All
 
         if fused_moe_state == FusedMoEState.MC2:
             return torchair_fused_experts_with_mc2(
@@ -1049,24 +1053,34 @@ class TorchairAscendFusedMoE(FusedMoE):
             self.moe_load = torch.zeros(local_num_experts, dtype=torch.int64)
 
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
-        self.enable_multistream_moe = \
-            ascend_config.torchair_graph_config.enable_multistream_moe and \
+        self.multistream_overlap_shared_expert = \
+            ascend_config.multistream_overlap_shared_expert and \
             self.torchair_graph_enabled
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError("Only softmax scoring function is supported for "
                              "non-grouped topk.")
-        self.moe = FusedMoEConfig.make(
-            num_experts=self.global_num_experts,
-            experts_per_token=top_k,
-            hidden_dim=hidden_size,
-            num_local_experts=self.local_num_experts,
-            moe_parallel_config=self.moe_parallel_config,
-            # TODO (bnell): this needs to be fixed for quantized types.
-            in_dtype=params_dtype,
-            quant_config=quant_config)
 
+        if vllm_version_is("0.10.2"):
+            self.moe = FusedMoEConfig.make(
+                num_experts=self.global_num_experts,
+                experts_per_token=top_k,
+                hidden_dim=hidden_size,
+                num_local_experts=self.local_num_experts,
+                moe_parallel_config=self.moe_parallel_config,
+                # TODO (bnell): this needs to be fixed for quantized types.
+                in_dtype=params_dtype,
+                quant_config=quant_config)
+        else:
+            self.moe = FusedMoEConfig(
+                num_experts=self.global_num_experts,
+                experts_per_token=top_k,
+                hidden_dim=hidden_size,
+                num_local_experts=self.local_num_experts,
+                moe_parallel_config=self.moe_parallel_config,
+                in_dtype=params_dtype,
+            )
         if quant_config is None:
             self.quant_method = TorchairAscendUnquantizedFusedMoEMethod(
                 self.moe)
@@ -1144,23 +1158,25 @@ class TorchairAscendFusedMoE(FusedMoE):
         forward_context = get_forward_context()
         fused_moe_state = forward_context.fused_moe_state
         mc2_mask = forward_context.mc2_mask
+        if self.enable_shared_expert_dp and fused_moe_state == FusedMoEState.MC2:
+            fused_moe_state = FusedMoEState.All2All
         # For w8a8 dynamic we can do npu_dynamic_quant and gate in parallel.
         quantized_x_for_share, dynamic_scale_for_share = None, None
-        from vllm_ascend.quantization.w8a8_dynamic import \
-            AscendW8A8DynamicFusedMoEMethod
-        if self.enable_multistream_moe:
+        from vllm_ascend.torchair.quantization.torchair_w8a8_dynamic import \
+            TorchairAscendW8A8DynamicFusedMoEMethod
+        if self.multistream_overlap_shared_expert:
             if not self.rm_router_logits:
                 router_logits, _ = gate(hidden_states)
             if hasattr(self.quant_method, "quant_method") and \
                isinstance(self.quant_method.quant_method,
-                          AscendW8A8DynamicFusedMoEMethod
+                          TorchairAscendW8A8DynamicFusedMoEMethod
                           ) and fused_moe_state == FusedMoEState.MC2:
                 with npu_stream_switch("moe_secondary", 0):
                     quantized_x_for_share, dynamic_scale_for_share = torch_npu.npu_dynamic_quant(
                         hidden_states)
 
         if shared_experts:
-            if not self.enable_multistream_moe or fused_moe_state != FusedMoEState.MC2:
+            if not self.multistream_overlap_shared_expert or fused_moe_state != FusedMoEState.MC2:
                 # When all_reduce_merge is in progress, shared_experts does not do all_reduce in mlp, but waits until shared_experts+router_experts are completed before doing all_reduce
                 shared_hidden_states = shared_experts(hidden_states)
 
@@ -1178,31 +1194,33 @@ class TorchairAscendFusedMoE(FusedMoE):
         if (fused_moe_state not in [
                 FusedMoEState.AllGather, FusedMoEState.AllGatherEP,
                 FusedMoEState.NaiveMulticast
-        ] and not replace_allreduce):
-            if fused_moe_state in {FusedMoEState.MC2}:
-                padding_size = forward_context.padded_num_tokens
-            else:
-                # TODO: Determine if we can remove the padding
-                padding_size = tp_size
-            if num_tokens < padding_size and not self.enable_shared_expert_dp:
-                hidden_states = nn.functional.pad(
-                    hidden_states, (0, 0, 0, padding_size - num_tokens))
-                router_logits = nn.functional.pad(
-                    router_logits, (0, 0, 0, padding_size - num_tokens))
+        ]):
             if tp_size > 1:
                 tp_rank = get_tensor_model_parallel_rank()
-                if not self.enable_shared_expert_dp:
-                    chunk_hidden_states = torch.tensor_split(hidden_states,
-                                                             tp_size,
-                                                             dim=0)
-                    chunk_router_logits = torch.tensor_split(router_logits,
-                                                             tp_size,
-                                                             dim=0)
-                    hidden_states = chunk_hidden_states[tp_rank]
-                    router_logits = chunk_router_logits[tp_rank]
-
                 chunk_mc2_mask = torch.tensor_split(mc2_mask, tp_size, dim=0)
                 mc2_mask = chunk_mc2_mask[tp_rank]
+            if not replace_allreduce:
+                if fused_moe_state in {FusedMoEState.MC2}:
+                    padding_size = forward_context.padded_num_tokens
+                else:
+                    # TODO: Determine if we can remove the padding
+                    padding_size = tp_size
+                if num_tokens < padding_size and not self.enable_shared_expert_dp:
+                    hidden_states = nn.functional.pad(
+                        hidden_states, (0, 0, 0, padding_size - num_tokens))
+                    router_logits = nn.functional.pad(
+                        router_logits, (0, 0, 0, padding_size - num_tokens))
+                if tp_size > 1:
+                    tp_rank = get_tensor_model_parallel_rank()
+                    if not self.enable_shared_expert_dp:
+                        chunk_hidden_states = torch.tensor_split(hidden_states,
+                                                                 tp_size,
+                                                                 dim=0)
+                        chunk_router_logits = torch.tensor_split(router_logits,
+                                                                 tp_size,
+                                                                 dim=0)
+                        hidden_states = chunk_hidden_states[tp_rank]
+                        router_logits = chunk_router_logits[tp_rank]
 
         if self.dp_size > 1:
             if fused_moe_state == FusedMoEState.AllGather:
@@ -1224,8 +1242,12 @@ class TorchairAscendFusedMoE(FusedMoE):
                     router_logits = get_dp_group().all_gather(router_logits, 0)
 
             elif fused_moe_state == FusedMoEState.NaiveMulticast:
-                cu_tokens_across_dp_cpu = get_forward_context(
-                ).dp_metadata.cu_tokens_across_dp_cpu
+                if vllm_version_is("0.10.2"):
+                    cu_tokens_across_dp_cpu = get_forward_context(
+                    ).dp_metadata.cu_tokens_across_dp_cpu
+                else:
+                    cu_tokens_across_dp_cpu = get_forward_context(
+                    ).dp_metadata.cu_tokens_across_sp(1)
                 hidden_states = self.naive_multicast(hidden_states,
                                                      cu_tokens_across_dp_cpu)
                 if self.rm_router_logits:
@@ -1254,7 +1276,8 @@ class TorchairAscendFusedMoE(FusedMoE):
             log2phy=self.log2phy,
             global_redundant_expert_num=self.global_redundant_expert_num,
             shared_experts=shared_experts if self.torchair_graph_enabled
-            and self.enable_multistream_moe and not is_prefill else None,
+            and self.multistream_overlap_shared_expert and not is_prefill else
+            None,
             mc2_mask=mc2_mask,
             quantized_x_for_share=quantized_x_for_share,
             dynamic_scale_for_share=dynamic_scale_for_share,

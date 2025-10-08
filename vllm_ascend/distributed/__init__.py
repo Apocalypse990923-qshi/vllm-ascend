@@ -26,3 +26,13 @@ KVConnectorFactory.register_connector(
 KVConnectorFactory.register_connector(
     "MooncakeConnectorV1", "vllm_ascend.distributed.mooncake_connector",
     "MooncakeConnector")
+
+KVConnectorFactory.register_connector(
+    "MooncakeConnectorStoreV1",
+    "vllm_ascend.distributed.mooncake.mooncake_store_connector_v1",
+    "MooncakeConnectorV1")
+
+KVConnectorFactory.register_connector(
+    "MooncakeLayerwiseConnector",
+    "vllm_ascend.distributed.mooncake_layerwise_connector",
+    "MooncakeLayerwiseConnector")

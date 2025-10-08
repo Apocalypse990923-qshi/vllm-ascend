@@ -21,13 +21,13 @@ import atexit
 import functools
 import math
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from threading import Lock
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import torch
-import torch_npu  # noqa: F401  # noqa: F401
+import torch_npu  # noqa: F401
 from packaging.version import InvalidVersion, Version
 from torch_npu.npu.streams import Event
 from vllm.logger import logger
@@ -39,14 +39,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
-
-# NOTE: Currently, we can only capture 1800 graphs at most,
-# due to the limitation of ACL graph. This number is bounded by
-# the number of streams, which is 2048, we save 248 streams
-# as a buffer.
-# Maximum number of graphs that can be captured by ACL Graph
-# TODO: Find out whether we need to solve allreduce function
-MAX_CAPTURE_SIZE = 1800
 
 ASCEND_QUANTIZATION_METHOD = "ascend"
 SOC_VERSION_INFERENCE_SERIES = ["Ascend310P3"]
@@ -293,6 +285,14 @@ def get_max_hidden_layers(hf_config) -> int:
 
 def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     """Update ACL graph capture sizes based on hardware limitations"""
+    # NOTE: Currently, we can only capture 1800 graphs at most,
+    # due to the limitation of ACL graph. This number is bounded by
+    # the number of streams, which is 2048, we save 248 streams
+    # as a buffer.
+    # Maximum number of graphs that can be captured by ACL Graph
+    # TODO: Find out whether we need to solve allreduce function
+    MAX_CAPTURE_SIZE = 1800
+
     # Store original configuration and temporarily clear it
     compilation_config = vllm_config.compilation_config
     original_sizes, compilation_config.cudagraph_capture_sizes = \
@@ -321,9 +321,16 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     if os.getenv("HCCL_OP_EXPANSION_MODE") == 'AIV':
         # TODO: Find out whether we need to take into account the pp_size
         parallel_factor = 1 + num_comm_groups + int(
-            parallel_config.enable_expert_parallel)
+            parallel_config.enable_expert_parallel) + int(
+                vllm_config.additional_config.get(
+                    "multistream_overlap_shared_expert", False))
         if is_moe_model(vllm_config):
             parallel_factor += (parallel_config.data_parallel_size > 1)
+        else:
+            # When AIV mode is enabled, the allreduce operator of the dense
+            # layer model will occupy additional streams, which are buffered here.
+            MAX_CAPTURE_SIZE = MAX_CAPTURE_SIZE - parallel_factor * resources_per_graph
+
         # Calculate maximum supported batch sizes considering model architecture on the A2 Hardware Device
         # Assume the following case:
         # MAX_CAPTURE_SIZE = 1920, num_hidden_layers = 48, data_parallel_size is 1, tensor_parallel_size is 4,
@@ -496,8 +503,10 @@ def register_ascend_customop(vllm_config: Optional[VllmConfig] = None):
 
     from vllm_ascend.models.layers.mla import AscendMultiHeadLatentAttention
     from vllm_ascend.ops.activation import AscendQuickGELU, AscendSiluAndMul
-    from vllm_ascend.ops.common_fused_moe import AscendFusedMoE
-    from vllm_ascend.ops.layernorm import AscendQuantRMSNorm, AscendRMSNorm
+    from vllm_ascend.ops.common_fused_moe import (AscendFusedMoE,
+                                                  AscendSharedFusedMoE)
+    from vllm_ascend.ops.layernorm import (AscendGemmaRMSNorm,
+                                           AscendQuantRMSNorm, AscendRMSNorm)
     from vllm_ascend.ops.linear import (AscendColumnParallelLinear,
                                         AscendMergedColumnParallelLinear,
                                         AscendQKVParallelLinear,
@@ -522,7 +531,9 @@ def register_ascend_customop(vllm_config: Optional[VllmConfig] = None):
         "ParallelLMHead": AscendParallelLMHead,
         "LogitsProcessor": AscendLogitsProcessor,
         "RMSNorm": AscendRMSNorm,
+        "GemmaRMSNorm": AscendGemmaRMSNorm,
         "FusedMoE": AscendFusedMoE,
+        "SharedFusedMoE": AscendSharedFusedMoE,
         "MultiHeadLatentAttention": AscendMultiHeadLatentAttention,
     }
 
@@ -586,6 +597,15 @@ def dense_optim_enable() -> bool:
     return envs_ascend.VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE
 
 
+def enable_sp(vllm_config=None) -> bool:
+    if vllm_config is None:
+        from vllm.config import get_current_vllm_config
+        vllm_config = get_current_vllm_config()
+    return (
+        vllm_config.compilation_config.pass_config.enable_sequence_parallelism
+        or envs_ascend.VLLM_ASCEND_ENABLE_FLASHCOMM)
+
+
 def is_moe_model(vllm_config: VllmConfig):
     config = vllm_config.model_config.hf_config
     return any('experts' in key.lower() for key in config.to_dict())
@@ -617,3 +637,16 @@ def weak_ref_tensors(
     if isinstance(tensors, tuple):
         return tuple(weak_ref_tensor(t) for t in tensors)
     raise ValueError("Invalid type for tensors")
+
+
+def npu_stream_switch(target_stream: torch.npu.Stream,
+                      *,
+                      enabled: bool = True):
+    """
+    Switch to the target stream if enabled is True.
+    Otherwise, do nothing.
+    """
+    if not enabled:
+        return nullcontext()
+    assert target_stream is not None
+    return torch.npu.stream(target_stream)
