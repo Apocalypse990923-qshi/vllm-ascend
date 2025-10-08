@@ -72,6 +72,7 @@ class CachedRequestState:
     num_computed_tokens_of_cp_sp_single: Optional[list[Optional[list[int]]]] = None  # Only accumulates each rank's own tokens
     num_computed_tokens_of_cp_sp_current: Optional[list[Optional[list[int]]]] = None  # Only records current chunk tokens per rank
     num_computed_tokens_of_cp_sp_accum: Optional[list[Optional[list[Optional[list[int]]]]]] = None  # Records computed tokens for each chunk
+    next_cp_dcp_start_rank: int = 0  # Tracks next starting rank for round-robin distribution
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)

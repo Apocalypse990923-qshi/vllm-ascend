@@ -23,6 +23,8 @@ from vllm.model_executor.layers.linear import (LinearBase,
 from vllm.utils import cdiv, round_down
 from vllm.v1.attention.backends.utils import AttentionCGSupport
 
+from vllm.logger import init_logger
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
@@ -34,6 +36,8 @@ from vllm_ascend.multistream.context import get_multistream_comm_context
 from vllm_ascend.multistream.ms_split import model_input_split_v1_mla_attn
 from vllm_ascend.utils import npu_prefetch, context_parallel_enable
 from vllm_ascend.worker.npu_input_batch import InputBatch
+
+logger = init_logger(__name__)
 
 if context_parallel_enable():
     from vllm.distributed import (get_context_model_parallel_rank,
@@ -779,7 +783,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             else:
                 # Original logic: CP-only mode
                 toks = prefill_metadata.chunked_context.seq_tot[i]
-                seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i].to(q_nope.device, dtype=torch.int32).contiguous()
+                seq_len2_all = prefill_metadata.chunked_context.chunk_seq_lens[i]
+                total_toks = toks
+                seq_len2 = seq_len2_all.to(q_nope.device, dtype=torch.int32).contiguous()
 
                 kv_c_normed = torch.empty(toks,
                                           num_heads,
@@ -830,7 +836,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
                 k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
                 k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
-            logger.info("--->here")
+            
             if self.cp_size * self.dcp_size > 1:
                 # CP+DCP mode: first compute this rank's contribution to the chunk
                 block_out_local = torch.empty(
@@ -843,28 +849,29 @@ class AscendMLAImpl(MLAAttentionImpl):
                             f"value:{v.shape}, seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
                             f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
 
-                if self._dump_enabled():
-                    _dump_step = self._prefill_step_idx
-                    prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
-                    prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
-                    prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
-                    prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
-                    prefill_value_0 = v.detach().cpu().to(torch.float32)
-                    prefill_block_table_0 = prefill_metadata.block_table.detach().cpu()
-                    self._maybe_dump_pickle(
-                        tag="kv_prefill_context_before_mla",
-                        payload={
-                            "layer_id": self.layer_id,
-                            "cp_rank": int(self.cp_rank),
-                            "prefill_q_nope": prefill_q_nope_0.numpy(),
-                            "prefill_q_pe": prefill_q_pe_0.numpy(),
-                            "prefill_k_nope": prefill_k_nope_0.numpy(),
-                            "prefill_k_pe": prefill_k_pe_0.numpy(),
-                            "prefill_value": prefill_value_0.numpy(),
-                            "prefill_block_table":prefill_block_table_0.numpy(),
-                        },
-                        step=_dump_step,
-                    )
+                # NOTE: Debug dump code commented out - requires _dump_enabled() and _maybe_dump_pickle() methods
+                # if self._dump_enabled():
+                #     _dump_step = self._prefill_step_idx
+                #     prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
+                #     prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
+                #     prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
+                #     prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
+                #     prefill_value_0 = v.detach().cpu().to(torch.float32)
+                #     prefill_block_table_0 = prefill_metadata.block_table.detach().cpu()
+                #     self._maybe_dump_pickle(
+                #         tag="kv_prefill_context_before_mla",
+                #         payload={
+                #             "layer_id": getattr(self, 'layer_id', -1),
+                #             "cp_rank": int(self.cp_rank),
+                #             "prefill_q_nope": prefill_q_nope_0.numpy(),
+                #             "prefill_q_pe": prefill_q_pe_0.numpy(),
+                #             "prefill_k_nope": prefill_k_nope_0.numpy(),
+                #             "prefill_k_pe": prefill_k_pe_0.numpy(),
+                #             "prefill_value": prefill_value_0.numpy(),
+                #             "prefill_block_table": prefill_block_table_0.numpy(),
+                #         },
+                #         step=_dump_step,
+                #     )
 
                 torch_npu.atb.npu_ring_mla(
                     q_nope=q_nope,
@@ -885,28 +892,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     softmax_lse=block_lse_local)
 
                 # CP dimension fusion (SP already handled above)
-                def _update_out_and_lse(out, lse, block_out, block_lse, token_mask=None):
-                    if out is None:
-                        out = block_out.to(torch.float32)
-                        lse = block_lse
-                    else:
-                        if token_mask is None:
-                            token_mask = torch.ones([block_out.size(0)], dtype=torch.uint8, device=block_out.device)
-
-                        out_mask = token_mask[:, None, None].expand_as(block_out)
-                        lse_mask = token_mask[:, None, None].expand_as(block_lse)
-                        block_out = block_out.to(torch.float32)
-                        out_wo = out.clone()
-                        lse_wo = lse.clone()
-                        logger.info(f"---->here, out shape:{out.shape}, lse shape:{lse.shape}, block_out:{block_out.shape}, block lse:{block_lse.shape}")
-
-                        out = out - F.sigmoid(block_lse - lse) * (out - block_out)
-                        lse = lse - F.logsigmoid(lse - block_lse)
-                        out = torch.where(out_mask, out, out_wo)
-                        lse = torch.where(lse_mask, lse, lse_wo)
-                    return out, lse
-
-                logger.info(f"--->here, out shape:{block_out_local.shape}, block_lse_local shape:{block_lse_local.shape}")
+                logger.debug(f"block_out_local shape:{block_out_local.shape}, block_lse_local shape:{block_lse_local.shape}")
 
                 block_lse_local_bt = block_lse_local.permute(1, 0).unsqueeze(-1)
                 out_lse_local = torch.cat([block_out_local, block_lse_local_bt], dim=-1)
@@ -917,21 +903,17 @@ class AscendMLAImpl(MLAAttentionImpl):
                 chunk_out_g = None
                 chunk_lse_g = None
                 for r in range(self.cp_size):
-                    logger.info("--->here")
                     out_lse_r = out_lse_list[r]
-                    logger.info("--->here")
                     out_r, lse_r = torch.split(out_lse_r, [self.v_head_dim, 1], dim=-1)
-                    logger.info(f"--->here, out_r shape:{out_r.shape}, lse_r.shape:{lse_r.shape}")
                     # DCP mode: each rank processed the full DCP sequence, use simplified mask
                     if self.dcp_size > 1:
                         token_mask = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)
                     else:
                         # Non-DCP mode uses original logic
-                        mask_req = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)  # simplified handling
-                        token_mask = mask_req
+                        token_mask = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)
                     chunk_out_g, chunk_lse_g = self._update_out_and_lse(
                         chunk_out_g, chunk_lse_g, out_r, lse_r, token_mask)
-                    logger.info(f"######, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}")
+                
                 if chunk_out_g is not None:
                     if prefix_lse_bt is None:
                         prefix_output = chunk_out_g.to(torch.float32)
