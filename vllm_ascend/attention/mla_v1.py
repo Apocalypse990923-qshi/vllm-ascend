@@ -1074,14 +1074,38 @@ class AscendMLAImpl(MLAAttentionImpl):
                                              device=kv_c_k_pe_local.device,
                                              dtype=kv_c_k_pe_local.dtype)
 
-                kv_c_k_pe_full_list = [None for _ in range(self.dcp_size)]
-                dist.all_gather_object(kv_c_k_pe_full_list,
-                                       kv_c_k_pe_local,
-                                       group=self.dcp_group)
-                kv_c_k_pe_full_list = [
-                    kv_c_k_pe for kv_c_k_pe in kv_c_k_pe_full_list
-                    if kv_c_k_pe is not None and kv_c_k_pe.numel() > 0
-                ]
+                dcp_total_toks = np.sum(req_dcp_sizes, axis=0).astype(int)  # shape (dcp_size,)
+                adjusted_dcp_total_toks = dcp_total_toks.copy()
+                zero_mask = (dcp_total_toks == 0)
+                if zero_mask.any():
+                    adjusted_dcp_total_toks[zero_mask] = 1
+                if dcp_total_toks[self.dcp_rank] == 0:
+                    # pad 1 token, to avoid 0 token bug caused by all_gather_into_tensor_uneven
+                    kv_local_for_gather = torch.zeros((1, latent_rope_dim),
+                                                    dtype=kv_c_k_pe_local.dtype,
+                                                    device=kv_c_k_pe_local.device)
+                else:
+                    kv_local_for_gather = kv_c_k_pe_local
+                total_toks_adjusted = int(np.sum(adjusted_dcp_total_toks))
+                kv_c_k_pe_full_adjusted = torch.empty((total_toks_adjusted, latent_rope_dim),
+                                                    dtype=kv_local_for_gather.dtype,
+                                                    device=kv_local_for_gather.device)
+                torch_npu.distributed.all_gather_into_tensor_uneven(
+                    kv_c_k_pe_full_adjusted,
+                    kv_local_for_gather,
+                    output_split_sizes=adjusted_dcp_total_toks.tolist(),
+                    group=self.dcp_group,
+                    async_op=False
+                )
+                offsets = np.cumsum(np.concatenate([[0], adjusted_dcp_total_toks[:-1]])).astype(int)
+                kv_c_k_pe_full_list = []
+                for r in range(len(adjusted_dcp_total_toks)):
+                    start = int(offsets[r])
+                    length = int(dcp_total_toks[r])     # unpad
+                    if dcp_total_toks[r] == 0:
+                        continue
+                    else:
+                        kv_c_k_pe_full_list.append(kv_c_k_pe_full_adjusted[start:start+length, :])
                 if len(kv_c_k_pe_full_list) > 0:
                     kv_c_k_pe_full = torch.cat(kv_c_k_pe_full_list, dim=0)
                 if len(kv_c_k_pe_full.shape) == 1:
@@ -1166,7 +1190,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     softmax_lse=prefix_lse)
 
             else:
-                assert not torch.all(context_seq_len == 0).item()
+                assert torch.all(seq_len[0] > 0).item() and not torch.all(seq_len[1] == 0).item()
                 # compute this chunk block then update prefix tensors to keep shapes consistent
                 torch_npu.atb.npu_ring_mla(
                     q_nope=q_nope,
