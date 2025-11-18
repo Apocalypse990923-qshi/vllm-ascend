@@ -1,0 +1,234 @@
+sort(index.begin(),index.end(),[&](const int& i, const int& j) { return nums2[i] < nums2[j]; });
+
+//or
+
+sort(arr.begin(), arr.end(), greater<int>()); //大-》小
+sort(arr.begin(), arr.end(), less<int>()); //小-》大
+
+int gcd(int x, int y){
+        if(x<y){
+            int t=x;
+            x=y;
+            y=t;
+        }
+        return y!=0?gcd(y,x%y):x;
+}
+
+
+struct cmp_greater{		//最大堆
+        bool operator()(const pair<int,int>& a, pair<int,int>& b){
+            return a.first<b.first;
+        }
+};
+
+struct cmp_less{	//最小堆
+        bool operator()(const pair<int,int>& a, pair<int,int>& b){
+            return a.first>b.first;
+        }
+};
+
+priority_queue<pair<int,int>, vector<pair<int,int>>, cmp_greater> buy_order;  	//大（头）----->小（尾）
+priority_queue<pair<int,int>, vector<pair<int,int>>, cmp_less> sell_order;	//小（头）----->大（尾）
+
+另一种写法
+struct entry{
+        vector<int> arr;
+        int sum;
+        bool operator < (const entry& that) const{
+            return sum>that.sum;
+        }
+};
+
+priority_queue<entry> q;
+
+
+//  线段树
+int n = nums1.size();
+vector<int> segtree(4*n+1);  //规模一般设置为4*n+1
+vector<bool> tag(4*n+1);	//懒惰标记
+build(segtree,0,nums1,0,n-1);
+
+void build(vector<int>& segtree, int index, vector<int>& arr, int st, int ed){
+        if(st==ed){
+            segtree[index] = arr[st];
+            return;
+        }
+        int m = (st+ed)/2;
+        build(segtree,index*2+1,arr,st,m);
+        build(segtree,index*2+2,arr,m+1,ed);
+        segtree[index] = segtree[index*2+1] + segtree[index*2+2];
+    }
+
+    int query(vector<int>& segtree, int index, int l, int r, int st, int ed, vector<bool>& tag){
+        if(st<=l && r<=ed){
+            return segtree[index];
+        }
+        if(r<st || ed<l)    return 0;
+        int ret = 0;
+        int m = (l+r)/2;
+        if(tag[index]){
+            tag[index]=false;
+            tag[2*index+1]= !tag[2*index+1];
+            tag[2*index+2]= !tag[2*index+2];
+            segtree[2*index+1] = (m-l+1)-segtree[2*index+1];
+            segtree[2*index+2] = (r-(m+1)+1)-segtree[2*index+2];
+        }
+        if(st<=m){
+            ret+=query(segtree, index*2+1, l, m, st, ed, tag);
+        }
+        if(ed>=m+1){
+            ret+=query(segtree,index*2+2, m+1, r, st, ed, tag);
+        }
+        return ret;
+    }
+
+    void modify(vector<int>& segtree, int index, int l, int r, int st, int ed, vector<bool>& tag){
+        if(st<=l && r<=ed){
+            segtree[index] = r-l+1-segtree[index];
+            tag[index] = !tag[index];
+            return;
+        }
+        if(r<st || ed<l)    return;
+        int m = (l+r)/2;
+        if(tag[index]){
+            tag[index]=false;
+            tag[2*index+1]= !tag[2*index+1];
+            tag[2*index+2]= !tag[2*index+2];
+            segtree[2*index+1] = (m-l+1)-segtree[2*index+1];
+            segtree[2*index+2] = (r-(m+1)+1)-segtree[2*index+2];
+        }
+        if(st<=m){
+            modify(segtree, index*2+1, l, m, st, ed, tag);
+        }
+        if(ed>=m+1){
+            modify(segtree,index*2+2, m+1, r, st, ed, tag);
+        }
+        segtree[index] = segtree[2*index+1] + segtree[2*index+2];
+    }
+
+//华为机考字符串输入getline
+//getline(cin,input)可以吃空格但cin>>不行
+#include <sstream>
+
+string input;
+while(cin>>input){
+	istringstream  is(input);
+	string add;
+	vector<string> v;
+	while(getline(is,add,'.'))	v.push_back(add);
+} // 注意！！！此方法会产生空字符
+
+//交换两个变量（实参，实际做到变量值的交换）
+#include <algorithm>
+swap(x,y)
+
+//二分查找
+#include <algorithm>
+std::vector<int>::iterator low,up;
+low=std::lower_bound (arr.begin(), arr.end(), bound); // 返回iterator指向（排序好的）数组中第一个大于等于bound的元素（若没有，则返回end()）
+up= std::upper_bound (arr.begin(), arr.end(), bound); // 返回iterator指向（排序好的）数组中第一个大于bound的元素（若没有，则返回end()
+//如果arr是2d的，例如vector<vector<int>> arr;
+up= std::upper_bound(arr.begin(), arr.end(), bound, [](int x, vector<int>& a)->bool{
+          return x < a[1];
+});
+
+auto it = prev(up) // 返回前一个iterator
+auto it = next(up) //返回下一个
+
+//map的erase返回下一个iterator
+map<int,int> jilu;
+auto it = jilu.begin();
+it = jilu.erase(it);
+
+//int to string
+#include <string>
+string str = std::to_string(num);
+//string to int
+int num = stoi(str);
+
+string::npos = -1;
+if(str1.find(str2,0)!=string::npos){
+	//找到一个！
+}
+
+ int是32位
+short是16位
+char是8位
+
+//获取vector<int> arr的子数组slice, for example arr[n,m]
+auto first = arr.cbegin() + n;	//实际数据类型为std::vector<int>::iterator
+auto last = v.cbegin() + m + 1;
+std::vector<int> new_arr(first, last);
+
+//也可用assign
+vector<int> new_arr;
+new_arr.assign(arr.begin()+n,arr.begin()+m+1);
+new_arr.assign(arr.begin()+1,arr.end());
+
+//set 除了count，还可以用find函数
+set<int> jilu;
+auto it = jilu.find(key);
+if(it==jilu.ends())	return -1; //没找到
+
+string::compare函数可比较字典序大小
+str1.compare(str2) < 0 //	str1字典序小于str2
+str1.compare(str2) == 0 //	str1与str2相等
+str1.compare(str2) > 0 //	str1字典序大于str2
+
+string str;
+reverse(str.begin(), str.end());  // 反转字符串
+
+//tuple
+std::tuple<int,int,int> t
+make_tuple(x,y,z)
+auto [x,y,z] = t
+get<0>(t)
+get<1>(t)
+get<2>(t)
+
+//resize
+vector<int> arr;
+arr.resize(10);
+
+//找最大值
+vector<int> arr;
+auto it = max_element(arr.begin(), arr.end());
+
+//累计值
+vector<int> arr;
+int sum = accumulate(arr.begin(), arr.end(), 0);
+
+
+//状态压缩：统计二进制中1的个数
+__builtin_popcount(num)
+
+//vector寻找元素可用标准库函数std::find
+auto it = std::find(vec.begin(), vec.end(), key);
+
+// 结构体排序
+bool compareStudents(const Student& a, const Student& b) {
+    return a.score < b.score; // 按成绩升序排序
+}
+
+std::sort(students.begin(), students.end(), compareStudents);
+
+// 初始化为升序排序数组
+#include <numeric>
+ std::vector<int> vec(num);  // 创建一个大小为num的vector
+ std::iota(vec.begin(), vec.end(), 0);  // 用0到num-1填充vector， 若第三个参数改为1，则从1开始
+
+// 用assign初始化
+vector<vector<int>> free_memSize;
+vector<vector<vector<device_info_struct>>> devices;
+free_memSize.assign(3, vector<int>(procNum, maxMemSize));
+devices.assign(3, vector<vector<device_info_struct>>(procNum, vector<device_info_struct>()));
+
+// vector拼接
+vec1.insert(vec1.end(), vec2.begin(), vec2.end());
+
+// string构造
+std::string const other("Exemplary");
+std::string s(other, 0, other.length() - 1); // Exemplar
+
+// string截取
+string substr = s.substr(2, 5) // 从索引2开始，截取5个字符

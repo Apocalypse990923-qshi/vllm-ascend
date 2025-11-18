@@ -1,0 +1,692 @@
+docker命令：
+docker rm 容器ID或名称
+docker load -i xxx.tar.gz	load镜像
+docker images
+docker ps
+docker ps -a		查看所有容器（包括已停止）
+docker exec -itu root '容器名' bash
+docker restart 	重启
+
+docker run配置：
+docker run --name 'long_seq_tmp' -it -d --net=host --shm-size=500g \
+        --privileged=true \
+        -w /home \
+        --device=/dev/davinci_manager \
+        --device=/dev/hisi_hdc \
+        --device=/dev/devmm_svm \
+        -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+        -v /usr/local/dcmi:/usr/local/dcmi \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+        -v /usr/local/sbin/:/usr/local/sbin \
+        -v /home:/home \
+	-v /mnt/:/mnt/ \
+        -v /tmp:/tmp \
+        -v /data:/data \
+        -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+        'vllm-ascend:dev-2.2.RC1.B070-800I-A3-py311-ubuntu22.04-aarch64' bash
+
+或者image ID方式
+docker run --name bybonline -it -d --net=host --shm-size=500g \
+    --privileged=true \
+    -w /home \
+    --device=/dev/davinci_manager \
+    --device=/dev/hisi_hdc \
+    --device=/dev/devmm_svm \
+    --entrypoint=bash \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /home:/home \
+    -v /tmp:/tmp \
+    -v /data:/data \
+    -v /mnt:/mnt \
+    -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+    -e http_proxy=$http_proxy \
+    -e https_proxy=$https_proxy \
+    64a688a95d89
+
+python调试环境配置launch.json
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: vllm_xqs",
+            "type": "python",
+            "request": "launch",
+            // "program": "/home/x00873815/vllm/acl_graph.py", // 此处填写工作目录
+            "console": "integratedTerminal",
+            "module": "vllm.entrypoints.openai.api_server",
+            "args": [
+                "--model", "/home/xxx",
+                "--trust-remote-code",
+                "--tensor-parallel-size", "2",
+                "--disable-frontend-multiprocessing",
+                "--port", "8888"
+            ],            
+            "env": { // bash 环境 
+                "HCCL_PORT": "9300",
+                "HCCL_IF_IP": "90.90.122.118",
+                "GLOO_SOCKET_IFNAME": "enp189s0f0",
+                "TP_SOCKET_IFNAME": "enp189s0f0",
+                "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                "ASCEND_RT_VISIBLE_DEVICES": "6,7",
+                "VLLM_USE_V1": "1",
+                "VLLM_LOGGING_LEVEL": "DEBUG",
+                "HCCL_ENTRY_LOG_ENABLE": "1",
+                "PYTHONPATH": "${PYTHONPATH}:/home/x00873815/vllm/:/home/x00873815/vllm-ascend/",
+                "ASCEND_GLOBAL_LOG_LEVEL": "0",
+                "ASCEND_HOST_LOG_FILE_NUM": "1000",
+                "HCCL_EXEC_TIMEOUT": "120",
+                "HCCL_CONNECT_TIMEOUT": "120",
+                "ACL_DEVICE_SYNC_TIMEOUT": "120"
+            },
+
+            "justMyCode": false, // 允许断点调试三方代码
+        }
+    ]
+}
+
+ray集群通信配置
+
+如果ray没有，则需要安装ray
+python -m pip install -U ray
+
+主节点（117）
+export HCCL_PORT=9301
+export HCCL_IF_IP=90.90.122.117
+export GLOO_SOCKET_IFNAME=enp189s0f0
+export TP_SOCKET_IFNAME=enp189s0f0
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+# export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES=2
+export VLLM_USE_V1=1
+export VLLM_LOGGING_LEVEL="DEBUG"
+export HCCL_ENTRY_LOG_ENABLE=1
+export PYTHONPATH="${PYTHONPATH}:/home/c00896210/online_predict/vllm/:/home/c00896210/online_predict/vllm-ascend/"
+export ASCEND_GLOBAL_LOG_LEVEL=0
+export ASCEND_HOST_LOG_FILE_NUM=1000
+export RAY_CGRAPH_get_timeout=10
+export TASK_QUEUE_ENABLE=0
+export HCCL_ASYNC_ERROR_HANDLING=0
+# export HCCL_EXEC_TIMEOUT=120
+# export HCCL_CONNECT_TIMEOUT=120
+# export ACL_DEVICE_SYNC_TIMEOUT=120
+
+#export ASCEND_GLOBAL_LOG_LEVEL=0  
+#export ASCEND_SLOG_PRINT_TO_STDOUT=1  
+#export ASCEND_GLOBAL_EVENT_ENABLE=1
+
+ray start --head --port=6378 --num-gpus=8
+
+
+从节点（118）
+export HCCL_PORT=9301
+export HCCL_IF_IP=90.90.122.118
+# export HCCL_EXEC_TIMEOUT=120
+# export HCCL_CONNECT_TIMEOUT=120
+export GLOO_SOCKET_IFNAME=enp189s0f0
+export TP_SOCKET_IFNAME=enp189s0f0
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export ASCEND_RT_VISIBLE_DEVICES=2
+# export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_USE_V1=1
+export HCCL_ENTRY_LOG_ENABLE=1
+export PYTHONPATH="${PYTHONPATH}:/home/c00896210/online_predict/vllm/:/home/c00896210/online_predict/vllm-ascend/"
+# export RAY_TMPDIR=/home/ray_tmp
+# export ASCEND_GLOBAL_LOG_LEVEL=0
+export ASCEND_HOST_LOG_FILE_NUM=1000
+export RAY_CGRAPH_get_timeout=10
+export TASK_QUEUE_ENABLE=0
+export HCCL_ASYNC_ERROR_HANDLING=0
+# export HCCL_EXEC_TIMEOUT=120
+# export HCCL_CONNECT_TIMEOUT=120
+# export ACL_DEVICE_SYNC_TIMEOUT=120
+# export MASTER_ADDR = "90.90.122.117"
+# export MASTER_PORT = "8888"
+# export WORLD_SIZE=2
+# export RANK=1
+#export ASCEND_GLOBAL_LOG_LEVEL=0  
+#export ASCEND_SLOG_PRINT_TO_STDOUT=1  
+#export ASCEND_GLOBAL_EVENT_ENABLE=1
+
+
+ray start --address='x.x.x.x:8888' --num-gpus=8 --node-ip-address=x.x.x.x
+
+
+多节点启动在线推理命令（图模式）
+python -m vllm.entrypoints.openai.api_server \
+       --model="/home/c00896210/Qwen2.5-0.5B-Instruct/" \
+       --trust-remote-code \
+       --distributed_executor_backend "ray" \
+       --tensor-parallel-size 2 \
+       --disable-frontend-multiprocessing \
+       --port 8888
+
+查看cann包版本
+cat /usr/local/Ascend/ascend-toolkit/latest/runtime/version.info
+
+在线推理测试
+curl -X POST http://127.0.0.1:8888/v1/completions       -H "Content-Type: application/json"      -d '{
+         "model": "/home/b30071341/online/Qwen2.5-0.5B-Instruct/",
+         "prompt": "AI的未来是",
+         "max_tokens": 24
+     }'
+
+hccl脚本测试
+torchrun --nproc_per_node 1 --nnodes 2 --master_addr 90.90.122.117 --master_port 6789 --node_rank 0 hccl_test.py
+torchrun --nproc_per_node 1 --nnodes 2 --master_addr 90.90.122.117 --master_port 6789 --node_rank 1 hccl_test.py
+————————————————————————————————————————————————————————————————
+新docker run配置（支持ray集群独立运行）：
+export IMAGE=cann:2.0.RC1.B115-800I-A2-py311-ubuntu24.04-aarch64
+export NAME=vllm_xqs_cann_800I
+
+docker run --rm \
+--name $NAME \
+--privileged=true \
+-w /home \
+--device /dev/davinci0 \
+--device /dev/davinci1 \
+--device /dev/davinci2 \
+--device /dev/davinci3 \
+--device /dev/davinci4 \
+--device /dev/davinci5 \
+--device /dev/davinci6 \
+--device /dev/davinci7 \
+--device /dev/davinci_manager \
+--device /dev/devmm_svm \
+--device /dev/hisi_hdc \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/dcmi:/usr/local/dcmi \
+-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+-v /usr/local/sbin/:/usr/local/sbin \
+-v /home:/home \
+-v /tmp:/tmp \
+-v /data:/data \
+-v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+-v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+-v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /root/.cache:/root/.cache \
+-v /home/x00873815/ray:/tmp/ray \
+-p 8000:8000 \
+-p 6380:6379 \
+-d --net=host --shm-size=500g \
+-it $IMAGE bash
+
+新机器的环境可能还需安装numpy等相关依赖
+pip install numpy==1.26.4 decorator attrs psutil absl-py cloudpickle scipy tornado transformers accelerate pandas
+
+单机使用torchrun不使用ray启动在线推理
+torchrun --nproc_per_node 1 --nnodes 1 --node_rank 1 --master_addr x.x.x.x --master_port 8888 -m vllm.entrypoints.openai.api_server \
+       --model="/home/b30071341/predict_online/weight/Qwen2.5-0.5B-Instruct/" \
+       --trust-remote-code \
+       --distributed_executor_backend "mp" \
+       --tensor-parallel-size 1 \
+       --disable-frontend-multiprocessing \
+       --port 8888
+
+_____________________________________________________________________
+
+单节点多卡 不同容器模拟ray不同节点
+
+docker network create --driver bridge ray-net
+docker network ls
+
+模拟主节点
+docker run --rm \
+--name 'online_ray_master' \
+--privileged=true \
+-w /home \
+--device /dev/davinci0 \
+--device /dev/davinci1 \
+--device /dev/davinci2 \
+--device /dev/davinci3 \
+--device /dev/davinci4 \
+--device /dev/davinci5 \
+--device /dev/davinci6 \
+--device /dev/davinci7 \
+--device /dev/davinci_manager \
+--device /dev/devmm_svm \
+--device /dev/hisi_hdc \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/dcmi:/usr/local/dcmi \
+-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+-v /usr/local/sbin/:/usr/local/sbin \
+-v /home:/home \
+-v /tmp:/tmp \
+-v /data:/data \
+-v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+-v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+-v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /root/.cache:/root/.cache \
+-v /home/b30071341/online/ray_master:/tmp/ray \
+-p 6380:6379 \
+-d --network ray-net --shm-size=500g \
+-it 'cann:2.0.RC1.B115-800I-A2-py311-ubuntu24.04-aarch64' bash
+
+模拟从节点
+docker run --rm \
+--name 'online_ray_slave' \
+--privileged=true \
+-w /home \
+--device /dev/davinci0 \
+--device /dev/davinci1 \
+--device /dev/davinci2 \
+--device /dev/davinci3 \
+--device /dev/davinci4 \
+--device /dev/davinci5 \
+--device /dev/davinci6 \
+--device /dev/davinci7 \
+--device /dev/davinci_manager \
+--device /dev/devmm_svm \
+--device /dev/hisi_hdc \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/dcmi:/usr/local/dcmi \
+-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+-v /usr/local/sbin/:/usr/local/sbin \
+-v /home:/home \
+-v /tmp:/tmp \
+-v /data:/data \
+-v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+-v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+-v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /root/.cache:/root/.cache \
+-v /home/b30071341/online/ray_slave:/tmp/ray \
+-p 6381:6379 \
+-d --network ray-net --shm-size=500g \
+-it 'cann:2.0.RC1.B115-800I-A2-py311-ubuntu24.04-aarch64' bash
+
+查看主节点（容器）IP
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' online_ray_master
+
+————————————————————————————————————————————————————————————
+
+多机dp demo
+
+tp2 dp2：
+    python /home/b3/online_dp/multi_instance_data_parallel.py
+
+    vllm serve /home/b30071341/online_dp/Qwen2.5-0.5B-Instruct -tp 2 -dp 2 -dpr 1 \
+        --data-parallel-address 141.61.41.133 --data-parallel-rpc-port 62300 \
+        --data-parallel-size-local 1 --headless
+
+纯tp2（dp1）：
+    python /home/b3/online_dp/multi_instance_data_parallel.py
+
+    vllm serve /home/b30071341/online_dp/Qwen2.5-0.5B-Instruct -tp 2 \
+        --data-parallel-address 141.61.41.133 \
+        -- --headless
+
+dp2：
+    python /home/b3/online_dp/multi_instance_data_parallel.py
+
+    vllm serve /home/b30071341/online_dp/Qwen2.5-0.5B-Instruct -dp 2 -dpr 1 \
+        --data-parallel-address 141.61.41.133 --data-parallel-rpc-port 62300 \
+        --data-parallel-size-local 1 --headless
+
+Once both instances have completed the handshake, this example will
+send a request to the instance with DP rank 1
+
+
+OK:
+vllm serve /home/b30071341/online_dp/Qwen2.5-0.5B-Instruct -dp 2 -dpr 1\
+        --data-parallel-address 141.61.41.133 --data-parallel-rpc-port 62300 \
+        --data-parallel-size-local 1 --headless
+
+————————————————————————————————————————————————————————————————
+
+在线benchmark
+
+服务端
+vllm serve /home/b30071341/online_dp/Qwen2.5-0.5B-Instruct \
+        --swap-space 16 \
+        --disable-log-requests
+
+客户端
+python benchmarks/benchmark_serving.py \
+        --backend "openai-chat" \
+        --model /home/b30071341/online_dp/Qwen2.5-0.5B-Instruct \
+        --dataset-name sharegpt \
+        --dataset-path <path to dataset> \
+        --request-rate <request_rate> \ # By default <request_rate> is inf
+        --num-prompts <num_prompts> # By default <num_prompts> is 1000
+
+——————————————————————————————————————————————————————————————————
+--trusted-host mirrors.aliyun.com
+
+在线推理命令
+vllm serve /home/x00873815/pangu7B-v5_0624/ \
+        --served-model-name "pangu7B" \
+        -tp 1 \
+        --max-num-seqs 16 \
+        --max-model-len 20480 \
+        --enforce-eager \
+        --no-enable-prefix-caching \
+        --trust-remote-code \
+        --additional-config '{"ascend_scheduler_config":{"enabled":true}}'
+在线推理测试
+curl -X POST http://0.0.0.0:8000/v1/completions       -H "Content-Type: application/json"      -d '{
+         "model": "pangu7B",
+         "prompt": "以下是中国关于计算机网络考试的单项选择题，请选出其中的正确答案。回答的最后一行应采用以下格式：”answer:$LETTER“（不带引号），其中LETTER 是ABCD之一。回答之前先一步步思考。\n\n对于传输层来说错误的是____\nA. TCP是全双工协议\nB. TCP是字节流协议\nC. TCP和UDP协议不能使用同一个端口\nD. TSAD是IP和端口的组合",
+         "max_tokens": 512
+     }'
+
+curl -X POST http://0.0.0.0:8000/v1/completions       -H "Content-Type: application/json"      -d '{
+         "model": "pangu7B",
+         "prompt": "The future of AI is",
+         "max_tokens": 128,
+	 "temperature": "1.0",
+	 "top_k": "-1",
+	 "top_p": "0.8",
+	 "seed": "1234",
+	 "repetition_penalty": "1.0",
+	 "top_n_sigma": "0.2"
+     }'
+
+ais_bench评测
+ais_bench test_xxx.py --dump-eval-details
+
+————————————————————————————————————————————————————————————————————————
+
+git config --global user.email "qiushixu@usc.edu"
+git config --global user.name "Apocalypse990923-qshi"
+git config --global --get http.proxy
+git config --global --get https.proxy
+git config --global --unset http.proxy
+git config --global --unset https.proxyr
+
+github username
+Apocalypse990923-qshi 
+github Personal access tokens (classic)：
+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
+
+如果你不希望改变项目的历史记录，只是想创建一个新的提交来“撤销”之前的提交，可以使用git revert。
+git revert <commit-hash>
+
+# Commit changed files using `-s`
+git commit -sm "your commit info"
+
+git push --force 覆盖之前的commit
+
+git reset --soft <早于你的一个提交的hash>	回退到你提交之间的状态，但保留你在本地的修改	如果是--hard 则不会保留你本地的更改
+git reset --hard HEAD		回退你的修改到当前最新版本
+
+git pull 更新本地
+git restore --staged <file_path> 撤销git add
+
+yapf -ir .		修改代码format
+yapf -i 文件名
+yapf -ir 文件夹名
+pip install -r requirements-lint.txt --trusted-host mirrors.aliyun.com
+mypy .
+bash tools/mypy.sh
+
+远程仓上sync fork后有新改动，直接git pull会失败因为可能会覆盖本地修改
+git stash
+git pull
+git stash pop
+
+要删除名为feature的本地分支，可以运行以下命令：git branch -D feature
+本地删除名为 upstream 的远程仓库的关联：git remote remove upstream
+_______________________________________________________________________________________________________________________________________________________
+
+sp代码
+https://github.com/vllm-project/vllm-ascend/commit/45826f5e4a2fc761595f40e596e3075de17ab269
+https://github.com/vllm-project/vllm-ascend/commit/8d2c7860ba5fa2c1dbcfd39f627a3cab56812208
+
+pangu7B代码
+3786205b2f356220670cbaa66477fe4cf3cea1c5
+d9576d012a7b8b4ecd583911bed5f9bba8a5be7f
+_________________________________________________________________________________________________________________________________________________________
+
+装vllm、vllm-ascend环境
+git clone https://github.com/Apocalypse990923-qshi/vllm.git					(git clone https://github.com/vllm-project/vllm.git)
+cd vllm
+git checkout releases/v0.9.1
+VLLM_TARGET_DEVICE=empty pip install -v -e . --trusted-host mirrors.aliyun.com
+
+git clone https://github.com/Apocalypse990923-qshi/vllm-ascend.git			(git clone https://github.com/vllm-project/vllm-ascend.git)
+cd vllm-ascend
+git checkout v0.9.1-dev
+pip install -v -e . --trusted-host mirrors.aliyun.com
+
+验证
+python
+>>> import torch, torch_npu
+>>> torch.randn(3, 4).npu()
+>>> import vllm
+>>> import vllm_ascend.vllm_ascend_C
+>>> torch.ops._C.rotary_embedding
+>>> torch.ops._C.weak_ref_tensor
+>>> quit()
+——————————————————————————————————————————————————————————————————————————
+可以通过设置 `upstream` 远程仓库的方式，把原始的 vllm-ascend 仓库添加为另一个远程源，从而同步它的其他分支（比如 `v0.9.1-dev`）到你的 fork 仓库本地。
+
+### ✅ 步骤1：添加 upstream 远程源
+假设你已经 `git clone` 了你自己的 fork 仓库，例如：
+git clone https://github.com/你的用户名/vllm-ascend.git
+cd vllm-ascend
+
+然后添加原始仓库为 `upstream`：
+git remote add upstream https://github.com/Ascend/vllm-ascend.git
+（若要添加新的upstream，需要移除原来的upstream，命令：git remote remove upstream）
+
+验证一下远程仓库：
+git remote -v
+
+输出应该类似：
+origin    https://github.com/你的用户名/vllm-ascend.git (fetch)
+origin    https://github.com/你的用户名/vllm-ascend.git (push)
+upstream  https://github.com/Ascend/vllm-ascend.git (fetch)
+upstream  https://github.com/Ascend/vllm-ascend.git (push)
+
+### ✅ 步骤2：获取 upstream 的所有分支
+git fetch upstream
+这将会把 `upstream` 仓库的所有分支拉到本地，但不会自动合并。
+
+### ✅ 步骤3：切换到你需要的分支（比如 `v0.9.1-dev`）
+git checkout -b v0.9.1-dev upstream/v0.9.1-dev
+这样你就创建了一个本地分支 `v0.9.1-dev`，它的起点是 `upstream/v0.9.1-dev`。
+
+### ✅ 步骤4（可选）：推送新分支到你自己的 fork 上
+如果你想把这个分支推送到你自己的 GitHub 仓库：
+git push origin v0.9.1-dev
+
+
+补充：
+你可以设置本地 v0.9.1-dev 去跟踪 upstream/v0.9.1-dev，以后更新就方便了：
+
+# 设置追踪关系
+git branch --set-upstream-to=upstream/v0.9.1-dev v0.9.1-dev
+
+以后只要执行：git pull
+就会把 upstream/v0.9.1-dev 的更新拉到本地 v0.9.1-dev
+
+或者更加优雅的方式：其实你当初就可以直接这样创建分支并建立追踪：
+git checkout --track -b v0.9.1-dev upstream/v0.9.1-dev
+
+这样 Git 就知道 v0.9.1-dev 本地分支要跟踪 upstream/v0.9.1-dev 了，后面用 git pull 就能同步。
+
+手动同步：git merge upstream/v0.9.1-dev
+_____________________________________________________________________________________________________________________________________________________
+
+k2万亿MoE
+
+超强杀脚本
+ps -ef | grep "python"| grep -v grep | awk '{print $2}' | xargs -t -i kill -9 {};pkill -9 python; pkill -9 torchrun;ray stop
+unset http
+unset https
+
+docker：kimi2_test
+pip install blobfile
+pip install cbor2
+pip install setproctitle
+
+docker exec -it kimi2_new bash
+bash /home/z00911894/code_sh/disaggregate_prefill_v1/rm.sh
+source /home/z00911894/CANN/ascend-toolkit/set_env.sh
+source /home/z00911894/CANN/nnal/atb/set_env.sh
+"expert_map_path":"/mnt/nfs/expert_map_graph_0815_8000_32_2.json"
+
+ais_bench：aisbench
+代码路径：/mnt/nfs/x00873815/kimi2_dev/vllm/:/mnt/nfs/x00873815/kimi2_dev/vllm-ascend/
+
+测试PD分离
+curl -X POST http://0.0.0.0:9000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek_v3",
+    "prompt": ["AI的未来是"],
+    "max_tokens": 5
+}'
+curl -X POST http://127.0.0.1:12349/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "dsv3",
+    "prompt": ["AI的未来是"],
+    "max_tokens": 128
+}'
+
+curl -X POST http://127.0.0.1:12347/v1/chat/completions \
+-H 'accept: application/json' \
+-H 'Content-Type: application/json' \
+-d '{
+  "model": "deepseek_v3",
+  "messages": [
+    { "role": "system", "content": "你是我的小助理" },
+    { "role": "user", "content": "告诉我你是谁" }
+  ],
+  "max_tokens": 128,
+}'
+
+测试P节点混步
+curl -X POST http://0.0.0.0:8004/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek_r1",
+    "prompt": ["The capital of France is"],
+    "max_tokens": 50
+}'
+
+curl -X POST http://0.0.0.0:12347/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/mnt/nfs/k2-w8a8-2",
+    "prompt": ["AI的未来是"], 
+    "max_tokens": 25
+}'
+
+测试D节点混步
+curl -X POST http://141.61.39.129:8004/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek_v3",
+    "prompt": ["AI的未来是"],
+    "max_tokens": 25
+}'
+
+ais_bench结果存放路径：pwd/outputs/default/
+
+curl -X POST http://localhost:9000/start_profile
+curl -X POST http://localhost:9000/stop_profile
+
+
+with open('/home/kimi2_test/log.txt', 'a') as f:
+	f.write(f"\n")
+
+# 重新加载守护进程配置
+sudo systemctl daemon-reload
+# 重启 Docker 服务
+sudo systemctl restart docker
+
+vim清空文本命令
+:1,%d
+
+————————————————————————————————————————————————————————————————————————————————————————————————————
+sp&cp + mtp +torchair
+
+scp -r root@141.61.41.132:/home/z00911889/data/model_from_hf/DeepSeek-V2-Lite/ /home/z00911889/data/model_from_hf/DeepSeek-V2-Lite/			scp命令服务器直接传文件
+
+deepseek_mtp 模型侧sp改动：
+https://github.com/vllm-project/vllm-ascend/commit/bed2098e95c5a3c7cc7559ca65a6f3759e308bb6
+__________________________________________________________________________________________________________________________________________________________________________________________________________________
+
+新浪PD分离
+
+bash /home/z00471799/xinlang_091/disaggregate_prefill_v1/rm.sh
+docker exec -it xinlang_091 bash
+cd /home/z00471799/xinlang_091/disaggregate_prefill_v1
+bash xinlang_server.sh
+proxy路径
+cd /home/z00471799/xinlang_091/vllm-ascend/examples/disaggregate_prefill_v1
+bash tesh.sh
+
+curl http://localhost:12349/v1/completions   -H "Content-Type: application/json"   -d '{
+        "model": "dsv3",
+        "prompt": "The capital of France is",
+        "max_tokens": 30,
+        "temperature": 0.8,
+        "top_p": 0.95
+      }'
+
+curl http://localhost:20002/v1/completions   -H "Content-Type: application/json"   -d '{
+        "model": "dsv3",
+        "prompt": "The capital of France is",
+        "max_tokens": 30,
+        "temperature": 0.8,
+        "top_p": 0.95
+      }'
+
+____________________________________________________________________________________________________________________________________________________________________________________________________________________________________
+
+pwdx pid进程号			可以查看谁
+
+tar -czvf env.tar.gz ./env 将压缩文件或文件夹压缩为.tar.gz
+tar -xvzf xxx.tar.gz -C /XXX/XXX(新环境路径) 		解压缩
+
+DEBUG采用同步算子下发模式 export ASCEND_LAUNCH_BLOCKING=1
+
+ut测试合入：https://github.com/LookAround0301/vllm-ascend-origin/pull/9
+
+torch_npu包替换可能需要彻底删除：rm -rf  /usr/local/python3.11.10/lib/python3.11/site-packages/torch_npu*
+查看torch_npu包功能与参数说明：vim /usr/local/python3.11.10/lib/python3.11/site-packages/torch_npu/op_plugin/atb/_atb_api_docs.py
+
+curl -X POST http://localhost:8004/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek_r1",
+    "prompt":[
+        "The capital of France is",
+        "Hello, my name is Tom, I am",
+        "The president of United States is",
+        "AI future is"
+    ],
+    "max_tokens": 50
+}'
+
+curl -X POST http://localhost:8004/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek_r1",
+    "prompt":[
+        "Kim has started his own housekeeping business and is calculating how much profit he will make from his clients. He already has 3 clients, but is talking to another 5 potential clients and feels confident enough to include them in his calculations. Each client\u2019s home will need 2 bottles of bleach and a pack of cloths to clean. Bottles of bleach will cost $2 each and packs of cloths will cost $5 each. These are his only expenses. He calculates that his total income each week will be $92. Profit is the difference between total income and total expenses, so how much profit, in dollars, will Lucas make each week?",
+	"The capital of France is",
+        "Hello, my name is Tom, I am",
+        "The president of United States is"
+    ],
+    "max_tokens": 50
+}'
+
+ais_bench --models vllm_api_general_chat --datasets gsm8k_gen_0_shot_cot_chat_prompt --search
+ais_bench --models vllm_api_general_chat --datasets gsm8k_gen_0_shot_cot_chat_prompt --summarizer example --dump-eval-details --merge-ds --num-prompts 50 --debug
+ais_bench --models vllm_api_stream_chat --datasets gsm8k_gen_0_shot_cot_chat_prompt --search
+ais_bench --models vllm_api_stream_chat --datasets gsm8k_gen_0_shot_cot_chat_prompt --summarizer example --dump-eval-details --merge-ds --num-prompts 100
+
+export ASCEND_MODULE_LOG_LEVEL=ATB=1  
+export ASCEND_SLOG_PRINT_TO_STDOUT=1
