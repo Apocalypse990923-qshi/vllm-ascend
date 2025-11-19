@@ -1,0 +1,86 @@
+入门大模型：
+
+ https://github.com/rasbt/LLMs-from-scratch
+
+ 
+
+1. CUDA 相关知识及算子开发
+
+    CUDA编程入门极简教程：https://zhuanlan.zhihu.com/p/34587739
+
+    从啥也不会到CUDA GEMM优化： https://zhuanlan.zhihu.com/p/703256080 
+
+    leetCUDA：https://github.com/xlite-dev/LeetCUDA
+
+ 
+
+2. 大模型推理相关：
+
+   主流部署框架：云端(vllm, SGLang, LMDeploy), 端侧(llama.cpp)
+
+（1）常见优化手段：FlashAttention、PD分离、PageAttention、Continuous Batching、Speculative Decoding、并行策略(TP、EP、PP、DP、SP等)、chunked prefill等。
+
+（2）LLM推理框架与关键特性：https://www.zhihu.com/column/c_1916901019268391457
+
+（3） LLM的推理优化技术纵览：https://zhuanlan.zhihu.com/p/642412124
+
+（4）解码策略相关：greedy search, random search, beam search；top_k/top_n, top_p, temperature scaling等。 
+
+（5）模型相关：MHA, MQA, GQA，MLA等
+
+ 
+
+3. 大模型训练相关：
+
+    开源框架：LlamaFactory
+
+    Qwen2.5-VL Fine-tuning: https://zhuanlan.zhihu.com/p/27491642059
+
+ 
+
+4.模型量化相关：
+（1）小模型量化：TensorRT-INT8、PTQ、QAT等。
+
+         NCNN量化详解：https://zhuanlan.zhihu.com/p/443715468
+
+（2）大模型量化：RTN、LLM-QAT、AWQ、LLM.int8()、GPTQ、SmoothQuant等。
+
+     
+
+其他：
+
+如何让vllm适配一个新模型：https://zhuanlan.zhihu.com/p/680636375
+
+FlashAttention的速度优化原理是怎样的？https://www.zhihu.com/question/611236756/answer/3132304304
+
+vllm V1 Scheduler的调度逻辑&优先级分析：https://zhuanlan.zhihu.com/p/1900957007575511876
+
+vLLM推理加速与参数配置：https://zhuanlan.zhihu.com/p/3722264996
+
+LLM微调实践：https://qiankunli.github.io/2024/07/28/llm_finetune_practice.html
+
+推理LLM梳理：https://qiankunli.github.io/2024/09/21/reasoning_model.html
+
+多模态技术梳理：Qwen-VL系列：https://zhuanlan.zhihu.com/p/25267823390
+
+一文读懂：大模型RAG（检索增强生成）https://zhuanlan.zhihu.com/p/675509396
+
+RAG分块策略：https://www.cnblogs.com/ting1/p/18598176
+
+SGLang：LLM推理引擎发展新方向 https://zhuanlan.zhihu.com/p/711378550
+如何通过Tiling优化加速算子https://2012labs.huawei.com/#/commando/series/1164034427884142592/detail
+
+vLLM Shenzhen Meetup：https://www.chaspark.com/#/live/1178781657188642816
+
+ 
+相关平台博主
+
+【知乎】猛猿、手抓饼熊、kaiyuan、紫气东来、王晋东不在家、碧空的算法之旅、SayHelloCode、陈清扬、BBuf、蓝色、杨军、nihui、燕小花、法斯特豪斯、Chayenne Zhao、OLDPAN、吃果冻不吐果冻皮、袁进辉、清风、田子宸、先进编译实验室、进击的程序猿、大家好我是爱因、AIGC那些事儿、田子宸、方佳瑞、北方的狼、队长、看图学、DefTruth ...
+
+【B站】月球大叔
+
+【YouTube】Hung-yi Lee
+
+ 
+
+前面提及的所有知识 在推荐的知乎博主文章都有详细解读，就不一 一链接对应啦。
